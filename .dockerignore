@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+.git
+.gitignore
+.venv/
+venv/
+vector_db/
+models/
+*.gguf
+.env
+.DS_Store
