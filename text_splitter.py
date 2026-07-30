@@ -9,13 +9,15 @@ from langchain_text_splitters import RecursiveCharacterTextSplitter
 
 def split_documents(
     documents: list[Document],
-    chunk_size: int = 500,
-    chunk_overlap: int = 80,
+    chunk_size: int = 1000,
+    chunk_overlap: int = 200,
 ) -> list[Document]:
+    # Optimized chunk size and separators to prevent splitting code blocks, 
+    # YAML files, JSON snippets, and multi-step lists apart.
     splitter = RecursiveCharacterTextSplitter(
         chunk_size=chunk_size,
         chunk_overlap=chunk_overlap,
-        separators=["\n\n", "\n", ". ", " ", ""],
+        separators=["\n\n", "\n", " ", ""],
         length_function=len,
     )
 
