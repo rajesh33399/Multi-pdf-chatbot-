@@ -16,7 +16,7 @@ from sentence_transformers import CrossEncoder
 from doc_loader import load_document
 from llm import ask_llm_stream, get_llm
 from text_splitter import split_documents
-from vector_store import create_vector_store
+from vector_store import create_vector_store, update_vector_store
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -215,6 +215,13 @@ uploaded_files = st.file_uploader(
 
 if uploaded_files:
     new_files = False
+    # FIXED: previously the code re-embedded ALL chunks from ALL files (old +
+    # new) on every upload, because it called create_vector_store() with the
+    # full st.session_state.all_chunks list each time. Adding a second file
+    # meant silently re-doing all the work for the first file too. Now we
+    # track only the chunks that are actually new this run, and add just
+    # those to the existing index.
+    new_chunks_this_run = []
 
     for uploaded_file in uploaded_files:
         file_bytes = uploaded_file.getvalue()
@@ -257,29 +264,40 @@ if uploaded_files:
                 st.session_state.all_documents.extend(documents)
                 st.session_state.all_chunks.extend(chunks)
                 st.session_state.processed_files.add(file_hash)
+                new_chunks_this_run.extend(chunks)
         finally:
             os.unlink(tmp_path)
 
-    if new_files and st.session_state.all_chunks:
-        with st.spinner("🔄 Updating vector index..."):
-            # Sort before joining: a set's iteration order isn't guaranteed
-            # stable across process restarts, so this keeps the cache key
-            # (and therefore the on-disk cache hit) deterministic.
-            combined_hash = hashlib.sha256(
-                "".join(sorted(st.session_state.processed_files)).encode()
-            ).hexdigest()
-            # FIXED: this call had no error handling at all. If it failed or
-            # timed out for any reason, the spinner just froze forever with
-            # no feedback and no log line telling you why. Now failures are
-            # caught, logged, and surfaced to the user.
-            try:
-                st.session_state.vector_store = create_vector_store(
-                    st.session_state.all_chunks, combined_hash
-                )
-                st.success("✅ All documents processed successfully!")
-            except Exception as e:
-                logger.exception("Vector index build failed")
-                st.error(f"Failed to build the vector index: {e}")
+    if new_files and new_chunks_this_run:
+        # Sort before joining: a set's iteration order isn't guaranteed
+        # stable across process restarts, so this keeps the cache key
+        # (and therefore the on-disk cache hit) deterministic.
+        combined_hash = hashlib.sha256(
+            "".join(sorted(st.session_state.processed_files)).encode()
+        ).hexdigest()
+
+        # FIXED: real progress feedback instead of a spinner that looks the
+        # same whether it's working or stuck. On a large PDF (thousands of
+        # chunks on a shared free-tier CPU) this can legitimately take
+        # minutes — now you can actually see it moving.
+        progress_bar = st.progress(0.0, text="🔄 Updating vector index...")
+
+        def _on_progress(done: int, total: int) -> None:
+            progress_bar.progress(done / total, text=f"🔄 Embedding chunks {done}/{total}...")
+
+        try:
+            st.session_state.vector_store = update_vector_store(
+                st.session_state.vector_store,
+                new_chunks_this_run,
+                combined_hash,
+                on_progress=_on_progress,
+            )
+            progress_bar.empty()
+            st.success("✅ All documents processed successfully!")
+        except Exception as e:
+            progress_bar.empty()
+            logger.exception("Vector index build failed")
+            st.error(f"Failed to build the vector index: {e}")
 
 
 # ----------------------------------------------------
