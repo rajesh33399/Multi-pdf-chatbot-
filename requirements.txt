@@ -9,3 +9,6 @@ huggingface-hub
 langchain-groq
 sentence-transformers
 langchain-huggingface
+pytesseract
+pdf2image
+Pillow
