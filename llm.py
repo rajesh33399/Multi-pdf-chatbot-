@@ -1,9 +1,9 @@
 """
-llm.py — Local LLM orchestration (TinyLlama via llama-cpp-python).
+llm.py — Local LLM orchestration (TinyLlama via ctransformers).
 
 - Lazily loads the model on first use and auto-downloads the GGUF weights
   from the Hugging Face Hub if they aren't already on disk.
-- Serializes access to the shared model with a lock, since llama-cpp-python
+- Serializes access to the shared model with a lock, since ctransformers
   is not safe for concurrent generate() calls on one instance, and Streamlit
   can serve multiple sessions from the same process.
 - Fully generic strict-RAG prompting — no document-type-specific parsing.
@@ -16,7 +16,8 @@ import threading
 from typing import Iterator, Optional
 
 from huggingface_hub import hf_hub_download
-from llama_cpp import Llama
+# SWAPPED: Using CTransformers instead of llama_cpp
+from langchain_community.llms import CTransformers
 
 logger = logging.getLogger(__name__)
 
@@ -41,14 +42,13 @@ NOT_FOUND_MSG = "Information not found in uploaded documents."
 # ----------------------------------------------------
 # Thread-safe lazy singleton
 # ----------------------------------------------------
-_llm_instance: Optional[Llama] = None
+_llm_instance: Optional[CTransformers] = None
 _load_lock = threading.Lock()
-_inference_lock = threading.Lock()  # serializes generate() calls across sessions
+_inference_lock = threading.Lock()  # serializes calls across sessions
 
 
 def _ensure_model_downloaded() -> str:
-    """Download the GGUF from the Hub if it isn't already on disk. Safe to call
-    at Docker build time (to bake the model into the image) or at runtime."""
+    """Download the GGUF from the Hub if it isn't already on disk."""
     if os.path.exists(MODEL_PATH):
         return MODEL_PATH
 
@@ -63,8 +63,8 @@ def _ensure_model_downloaded() -> str:
     return downloaded_path
 
 
-def get_llm() -> Llama:
-    """Return the shared Llama instance, loading (and downloading, if needed) it
+def get_llm() -> CTransformers:
+    """Return the shared CTransformers instance, loading (and downloading, if needed) it
     on first use."""
     global _llm_instance
 
@@ -78,12 +78,20 @@ def get_llm() -> Llama:
                 "Loading TinyLlama from %s (n_ctx=%s, n_threads=%s)",
                 model_path, N_CTX, N_THREADS,
             )
-            _llm_instance = Llama(
-                model_path=model_path,
-                n_ctx=N_CTX,
-                n_threads=N_THREADS,
-                n_batch=N_BATCH,
-                verbose=False,
+            
+            # Converted initialization configuration for CTransformers
+            _llm_instance = CTransformers(
+                model=model_path,
+                model_type="llama",
+                config={
+                    'max_new_tokens': MAX_OUTPUT_TOKENS,
+                    'temperature': 0.0,
+                    'top_p': 0.1,
+                    'repetition_penalty': 1.2,
+                    'context_length': N_CTX,
+                    'threads': N_THREADS,
+                    'batch_size': N_BATCH
+                }
             )
     return _llm_instance
 
@@ -96,9 +104,6 @@ def _build_prompt(context: str, question: str, history: Optional[list[dict]] = N
 
     history_block = ""
     if history:
-        # Only the single most recent exchange — TinyLlama's context window is
-        # tight, and the retrieved document context matters far more than
-        # chat history for answer accuracy.
         last_user = next((m["content"] for m in reversed(history) if m.get("role") == "user"), None)
         last_assistant = next((m["content"] for m in reversed(history) if m.get("role") == "assistant"), None)
         if last_user and last_assistant:
@@ -123,16 +128,6 @@ Question: {question}
 <|assistant|>"""
 
 
-_STOP_SEQUENCES = ["<|user|>", "<|system|>", "Question:"]
-_GEN_KWARGS = dict(
-    max_tokens=MAX_OUTPUT_TOKENS,
-    temperature=0.0,
-    top_p=0.1,
-    repeat_penalty=1.2,
-    stop=_STOP_SEQUENCES,
-)
-
-
 def ask_llm(context: str, question: str, history: Optional[list[dict]] = None) -> str:
     """Blocking call — returns the full answer as a string."""
     if not context or not context.strip():
@@ -143,8 +138,8 @@ def ask_llm(context: str, question: str, history: Optional[list[dict]] = None) -
     try:
         llm = get_llm()
         with _inference_lock:
-            response = llm(prompt, **_GEN_KWARGS)
-        answer = response["choices"][0]["text"].strip()
+            # Invokes the model directly via pure Python
+            answer = llm.invoke(prompt).strip()
     except Exception:
         logger.exception("LLM generation failed")
         return "The assistant hit an error while generating a response. Please try again."
@@ -167,9 +162,12 @@ def ask_llm_stream(context: str, question: str, history: Optional[list[dict]] = 
         llm = get_llm()
         with _inference_lock:
             produced_any = False
-            for chunk in llm(prompt, stream=True, **_GEN_KWARGS):
-                token = chunk["choices"][0]["text"]
+            # Yielding token generation segments iteratively matching Streamlit UI patterns
+            for token in llm.stream(prompt):
                 if token:
+                    # Strip any system stop tags if they leak into generation
+                    if any(stop in token for stop in ["<|user|>", "<|system|>", "Question:"]):
+                        break
                     produced_any = True
                     yield token
         if not produced_any:
