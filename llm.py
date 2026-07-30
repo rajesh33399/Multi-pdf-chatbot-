@@ -31,12 +31,12 @@ MODEL_DIR = os.environ.get("MODEL_DIR", "models")
 MODEL_PATH = os.path.join(MODEL_DIR, MODEL_FILENAME)
 
 N_CTX = int(os.environ.get("LLM_N_CTX", "2048"))
-N_THREADS = int(os.environ.get("LLM_N_THREADS", "2"))
+N_THREADS = int(os.environ.get("LLM_N_THREADS", "6"))
 N_BATCH = int(os.environ.get("LLM_N_BATCH", "32"))
 
 MAX_CONTEXT_CHARS = int(os.environ.get("MAX_CONTEXT_CHARS", "3500"))
 MAX_HISTORY_CHARS = int(os.environ.get("MAX_HISTORY_CHARS", "400"))
-MAX_OUTPUT_TOKENS = int(os.environ.get("LLM_MAX_TOKENS", "256"))
+MAX_OUTPUT_TOKENS = int(os.environ.get("LLM_MAX_TOKENS", "128"))
 
 NOT_FOUND_MSG = "Information not found in uploaded documents."
 
