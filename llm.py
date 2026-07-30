@@ -13,6 +13,7 @@ import logging
 import os
 import re
 import threading
+import time
 from typing import Iterator, Optional
 
 from huggingface_hub import hf_hub_download
@@ -30,7 +31,14 @@ MODEL_DIR = os.environ.get("MODEL_DIR", "models")
 MODEL_PATH = os.path.join(MODEL_DIR, MODEL_FILENAME)
 
 N_CTX = int(os.environ.get("LLM_N_CTX", "2048"))
-N_THREADS = int(os.environ.get("LLM_N_THREADS", str(os.cpu_count() or 2)))
+# FIXED: os.cpu_count() reports the HOST machine's core count, not the CPU
+# quota actually granted to this container. Logs showed n_threads=16 being
+# requested, which on Streamlit Cloud's free tier (a small fraction of a
+# core) causes severe thread contention/context-switching. The process
+# never errors or crashes -- it just runs (near-)forever without producing
+# a single token, which looks identical to "frozen". Cap threads to a small,
+# safe default. Override with LLM_N_THREADS if you know your actual quota.
+N_THREADS = int(os.environ.get("LLM_N_THREADS", "2"))
 N_BATCH = int(os.environ.get("LLM_N_BATCH", "32"))
 
 MAX_CONTEXT_CHARS = int(os.environ.get("MAX_CONTEXT_CHARS", "3500"))
@@ -78,7 +86,7 @@ def get_llm() -> CTransformers:
                 "Loading TinyLlama from %s (n_ctx=%s, n_threads=%s)",
                 model_path, N_CTX, N_THREADS,
             )
-            
+
             # Converted initialization configuration for CTransformers
             _llm_instance = CTransformers(
                 model=model_path,
@@ -93,6 +101,7 @@ def get_llm() -> CTransformers:
                     'batch_size': N_BATCH
                 }
             )
+            logger.info("TinyLlama loaded and ready.")
     return _llm_instance
 
 
@@ -135,11 +144,12 @@ def ask_llm(context: str, question: str, history: Optional[list[dict]] = None) -
 
     prompt = _build_prompt(context, question, history)
 
+    t0 = time.time()
     try:
         llm = get_llm()
         with _inference_lock:
-            # Invokes the model directly via pure Python
             answer = llm.invoke(prompt).strip()
+        logger.info("LLM generation took %.1fs", time.time() - t0)
     except Exception:
         logger.exception("LLM generation failed")
         return "The assistant hit an error while generating a response. Please try again."
@@ -158,18 +168,28 @@ def ask_llm_stream(context: str, question: str, history: Optional[list[dict]] = 
 
     prompt = _build_prompt(context, question, history)
 
+    # FIXED: this function previously had zero logging, so when generation
+    # hung there was no way to tell from the logs whether it was stuck
+    # loading the model, stuck waiting for the first token, or actually
+    # producing tokens slowly. Now every stage is visible.
+    t0 = time.time()
+    logger.info("Starting streaming generation...")
     try:
         llm = get_llm()
         with _inference_lock:
             produced_any = False
-            # Yielding token generation segments iteratively matching Streamlit UI patterns
+            first_token_logged = False
             for token in llm.stream(prompt):
                 if token:
                     # Strip any system stop tags if they leak into generation
                     if any(stop in token for stop in ["<|user|>", "<|system|>", "Question:"]):
                         break
+                    if not first_token_logged:
+                        logger.info("First token after %.1fs", time.time() - t0)
+                        first_token_logged = True
                     produced_any = True
                     yield token
+        logger.info("Streaming generation finished in %.1fs", time.time() - t0)
         if not produced_any:
             yield NOT_FOUND_MSG
     except Exception:
