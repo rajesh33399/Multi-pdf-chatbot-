@@ -8,3 +8,4 @@ faiss-cpu
 huggingface-hub
 langchain-groq
 sentence-transformers
+langchain-huggingface
