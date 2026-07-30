@@ -25,8 +25,18 @@ logger = logging.getLogger(__name__)
 # ----------------------------------------------------
 # Configuration (override via environment variables)
 # ----------------------------------------------------
-MODEL_REPO_ID = os.environ.get("MODEL_REPO_ID", "TheBloke/TinyLlama-1.1B-Chat-v1.0-GGUF")
-MODEL_FILENAME = os.environ.get("MODEL_FILENAME", "tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf")
+MODEL_REPO_ID = os.environ.get("MODEL_REPO_ID", "bartowski/Llama-3.2-1B-Instruct-GGUF")
+MODEL_FILENAME = os.environ.get("MODEL_FILENAME", "Llama-3.2-1B-Instruct-Q4_K_M.gguf")
+# NOTE: swapped from TinyLlama-1.1B to Llama-3.2-1B-Instruct for better
+# instruction-following / context-grounding. Same "llama" architecture
+# family, similar size/RAM footprint. CAVEAT: ctransformers is lightly
+# maintained and Llama 3.x uses newer internals (different RoPE base,
+# larger vocab) than Llama 2. It should load since it's tagged "llama"
+# architecture, but if output comes out garbled/nonsensical (not just
+# imperfect — actually broken), that means ctransformers doesn't fully
+# support Llama 3.x's internals. In that case, revert both lines above to:
+#   MODEL_REPO_ID = "TheBloke/TinyLlama-1.1B-Chat-v1.0-GGUF"
+#   MODEL_FILENAME = "tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf"
 MODEL_DIR = os.environ.get("MODEL_DIR", "models")
 MODEL_PATH = os.path.join(MODEL_DIR, MODEL_FILENAME)
 
