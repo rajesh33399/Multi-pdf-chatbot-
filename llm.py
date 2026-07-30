@@ -25,21 +25,12 @@ logger = logging.getLogger(__name__)
 # ----------------------------------------------------
 # Configuration (override via environment variables)
 # ----------------------------------------------------
-# FIXED: Reverted back to TinyLlama because ctransformers does not support
-# newer Llama 3.x internals and throws a RuntimeError on startup.
 MODEL_REPO_ID = os.environ.get("MODEL_REPO_ID", "TheBloke/TinyLlama-1.1B-Chat-v1.0-GGUF")
 MODEL_FILENAME = os.environ.get("MODEL_FILENAME", "tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf")
 MODEL_DIR = os.environ.get("MODEL_DIR", "models")
 MODEL_PATH = os.path.join(MODEL_DIR, MODEL_FILENAME)
 
 N_CTX = int(os.environ.get("LLM_N_CTX", "2048"))
-# FIXED: os.cpu_count() reports the HOST machine's core count, not the CPU
-# quota actually granted to this container. Logs showed n_threads=16 being
-# requested, which on Streamlit Cloud's free tier (a small fraction of a
-# core) causes severe thread contention/context-switching. The process
-# never errors or crashes -- it just runs (near-)forever without producing
-# a single token, which looks identical to "frozen". Cap threads to a small,
-# safe default. Override with LLM_N_THREADS if you know your actual quota.
 N_THREADS = int(os.environ.get("LLM_N_THREADS", "2"))
 N_BATCH = int(os.environ.get("LLM_N_BATCH", "32"))
 
@@ -89,15 +80,14 @@ def get_llm() -> CTransformers:
                 model_path, N_CTX, N_THREADS,
             )
 
-            # Converted initialization configuration for CTransformers
             _llm_instance = CTransformers(
                 model=model_path,
                 model_type="llama",
                 config={
                     'max_new_tokens': MAX_OUTPUT_TOKENS,
-                    'temperature': 0.0,
+                    'temperature': 0.1,
                     'top_p': 0.1,
-                    'repetition_penalty': 1.2,
+                    'repetition_penalty': 1.1,
                     'context_length': N_CTX,
                     'threads': N_THREADS,
                     'batch_size': N_BATCH
@@ -108,10 +98,12 @@ def get_llm() -> CTransformers:
 
 
 # ----------------------------------------------------
-# Prompt construction — generic strict-RAG, no document-type assumptions
+# Prompt construction — optimized for small LLMs (TinyLlama)
 # ----------------------------------------------------
 def _build_prompt(context: str, question: str, history: Optional[list[dict]] = None) -> str:
-    context = re.sub(r"\s+", " ", context).strip()[:MAX_CONTEXT_CHARS]
+    # FIXED: Replaced aggressive whitespace flattening (re.sub(r"\s+", " ")) 
+    # which previously destroyed multi-line code blocks, YAML files, and lists.
+    context = context.strip()[:MAX_CONTEXT_CHARS]
 
     history_block = ""
     if history:
@@ -122,14 +114,7 @@ def _build_prompt(context: str, question: str, history: Optional[list[dict]] = N
             history_block = snippet[:MAX_HISTORY_CHARS]
 
     return f"""<|system|>
-You are a strict document QA assistant. You have no outside knowledge.
-
-RULES:
-1. Answer ONLY using facts directly stated in the Context below.
-2. If the Context defines a term or acronym, copy that definition's exact wording — do NOT paraphrase, rename, or substitute a different expansion from what you may already know.
-3. If the answer is NOT in the Context, respond ONLY with: "{NOT_FOUND_MSG}"
-4. Never invent facts, definitions, or explanations not present in the Context.
-5. Keep answers brief, factual, and directly grounded in the Context.
+You are a helpful document assistant. Answer the question using only the provided context. If the answer is not in the context, reply with "{NOT_FOUND_MSG}".
 
 <|user|>
 {history_block}Context:
@@ -163,18 +148,13 @@ def ask_llm(context: str, question: str, history: Optional[list[dict]] = None) -
 
 
 def ask_llm_stream(context: str, question: str, history: Optional[list[dict]] = None) -> Iterator[str]:
-    """Generator — yields text chunks as they're produced. Pass directly to
-    st.write_stream() for token-by-token display."""
+    """Generator — yields text chunks as they're produced."""
     if not context or not context.strip():
         yield NOT_FOUND_MSG
         return
 
     prompt = _build_prompt(context, question, history)
 
-    # FIXED: this function previously had zero logging, so when generation
-    # hung there was no way to tell from the logs whether it was stuck
-    # loading the model, stuck waiting for the first token, or actually
-    # producing tokens slowly. Now every stage is visible.
     t0 = time.time()
     logger.info("Starting streaming generation...")
     try:
@@ -184,7 +164,6 @@ def ask_llm_stream(context: str, question: str, history: Optional[list[dict]] = 
             first_token_logged = False
             for token in llm.stream(prompt):
                 if token:
-                    # Strip any system stop tags if they leak into generation
                     if any(stop in token for stop in ["<|user|>", "<|system|>", "Question:"]):
                         break
                     if not first_token_logged:
