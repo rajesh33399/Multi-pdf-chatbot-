@@ -49,8 +49,22 @@ def warm_up_llm() -> bool:
     return True
 
 
-reranker = load_reranker()
-warm_up_llm()
+# FIXED: These two calls used to run unconditionally at import time, meaning
+# every single page load/rerun forced ~650MB (LLM) + ~90MB (reranker) into
+# RAM immediately -- even before a file was uploaded or a question was asked.
+# On Streamlit Cloud's ~1GB RAM free tier, that leaves almost nothing for the
+# embedding model + FAISS index build that happens during PDF upload, so the
+# process gets OOM-killed mid-index (which looks like an infinite "Updating
+# vector index..." spinner, since a killed process reports no error to the UI).
+#
+# Fix: don't call them here. Call load_reranker() / get_llm() lazily, only at
+# the point they're actually needed (inside retrieve_documents() and inside
+# the chat-answer block below). @st.cache_resource still means each one only
+# loads ONCE per server process -- we're not losing caching, just deferring
+# the first load to when it's actually required.
+#
+# reranker = load_reranker()   # REMOVED
+# warm_up_llm()                 # REMOVED
 
 
 @st.cache_data(show_spinner=False)
@@ -112,6 +126,11 @@ def remove_duplicates(docs):
 def retrieve_documents(question, documents, vector_store, top_k=TOP_K):
     """MMR search for diverse, non-redundant candidates, optional source
     filtering, then cross-encoder reranking for final relevance ordering."""
+    # FIXED: reranker is now loaded here, lazily, on first real search --
+    # not at app startup. @st.cache_resource means this is still a no-op
+    # (instant) on every call after the first.
+    reranker = load_reranker()
+
     target_sources = detect_target_documents(question, documents)
 
     raw_results = vector_store.max_marginal_relevance_search(
@@ -213,7 +232,18 @@ if uploaded_files:
 
         try:
             with st.spinner(f"📄 Processing {uploaded_file.name}..."):
-                documents = load_document(tmp_path, uploaded_file.name)
+                # FIXED: loading/parsing a file can throw (corrupt PDF, scanned
+                # image-only PDF with no extractable text, bad encoding, etc.)
+                # Previously that exception had nothing to catch it here, so it
+                # bubbled straight to Streamlit's generic crash screen with no
+                # useful message. Now we catch it, log the real traceback to
+                # the server logs, and show the user a clear, specific error.
+                try:
+                    documents = load_document(tmp_path, uploaded_file.name)
+                except Exception as e:
+                    logger.exception("Failed to load %s", uploaded_file.name)
+                    st.error(f"Could not read {uploaded_file.name}: {e}")
+                    continue
 
                 if not documents:
                     st.warning(f"No readable text found in {uploaded_file.name}")
@@ -238,10 +268,18 @@ if uploaded_files:
             combined_hash = hashlib.sha256(
                 "".join(sorted(st.session_state.processed_files)).encode()
             ).hexdigest()
-            st.session_state.vector_store = create_vector_store(
-                st.session_state.all_chunks, combined_hash
-            )
-        st.success("✅ All documents processed successfully!")
+            # FIXED: this call had no error handling at all. If it failed or
+            # timed out for any reason, the spinner just froze forever with
+            # no feedback and no log line telling you why. Now failures are
+            # caught, logged, and surfaced to the user.
+            try:
+                st.session_state.vector_store = create_vector_store(
+                    st.session_state.all_chunks, combined_hash
+                )
+                st.success("✅ All documents processed successfully!")
+            except Exception as e:
+                logger.exception("Vector index build failed")
+                st.error(f"Failed to build the vector index: {e}")
 
 
 # ----------------------------------------------------
@@ -302,6 +340,13 @@ if question:
             answer = "Information not found in uploaded documents."
             st.markdown(answer)
         else:
+            # FIXED: the LLM is now warmed up here, lazily, right before it's
+            # actually needed to answer a question -- not at app startup.
+            # This is the first time in the whole app lifecycle the ~650MB
+            # model gets pulled into RAM, so it no longer competes with the
+            # embedding step during PDF upload for the same memory budget.
+            with st.spinner("🤖 Loading local AI model (first question only, please wait)..."):
+                warm_up_llm()
             answer = st.write_stream(ask_llm_stream(context, question, history=history_for_llm))
 
         if results:
@@ -309,15 +354,16 @@ if question:
                 render_sources(results)
 
     st.session_state.messages.append({"role": "assistant", "content": answer, "sources": results})
-    # --- Chat History Download Feature ---
+
+# --- Chat History Download Feature ---
 if "messages" in st.session_state and st.session_state.messages:
     # 1. Format the conversation list into clean text lines
     chat_log = ""
     for msg in st.session_state.messages:
         role = "User" if msg["role"] == "user" else "Assistant"
         chat_log += f"[{role}]: {msg['content']}\n\n"
-    
-    # 2. Add a styled download button 
+
+    # 2. Add a styled download button
     st.sidebar.download_button(
         label="📥 Download Chat History",
         data=chat_log,
