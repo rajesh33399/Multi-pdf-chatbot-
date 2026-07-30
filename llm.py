@@ -19,8 +19,6 @@ MAX_CONTEXT_CHARS = int(os.environ.get("MAX_CONTEXT_CHARS", "3500"))
 MAX_HISTORY_CHARS = int(os.environ.get("MAX_HISTORY_CHARS", "400"))
 MAX_OUTPUT_TOKENS = int(os.environ.get("LLM_MAX_TOKENS", "512"))
 
-NOT_FOUND_MSG = "Information not found in uploaded documents."
-
 # ----------------------------------------------------
 # LLM Singleton
 # ----------------------------------------------------
@@ -52,8 +50,8 @@ def _build_prompt(context: str, question: str, history: Optional[list[dict]] = N
             history_block = snippet[:MAX_HISTORY_CHARS]
 
     system_prompt = (
-        "You are a helpful document assistant. Answer the question using only the provided context. "
-        f'If the answer is not in the context, reply with "{NOT_FOUND_MSG}".'
+        "You are a helpful assistant. Use the provided document context to answer the question when relevant. "
+        "If the answer cannot be found in the context, use your own general knowledge and training to provide a helpful, accurate, and complete answer."
     )
     
     user_prompt = f"{history_block}Context:\n{context}\n\nQuestion: {question}"
@@ -66,9 +64,6 @@ def _build_prompt(context: str, question: str, history: Optional[list[dict]] = N
 
 def ask_llm(context: str, question: str, history: Optional[list[dict]] = None) -> str:
     """Blocking call — returns the full answer as a string."""
-    if not context or not context.strip():
-        return NOT_FOUND_MSG
-
     messages = _build_prompt(context, question, history)
 
     try:
@@ -79,17 +74,11 @@ def ask_llm(context: str, question: str, history: Optional[list[dict]] = None) -
         logger.exception("LLM generation failed")
         return "The assistant hit an error while generating a response. Please check your GROQ_API_KEY."
 
-    if len(answer) < 2:
-        return NOT_FOUND_MSG
-    return answer
+    return answer if answer else "I couldn't generate a response."
 
 
 def ask_llm_stream(context: str, question: str, history: Optional[list[dict]] = None) -> Iterator[str]:
     """Generator — yields text chunks as they're produced for token-by-token streaming."""
-    if not context or not context.strip():
-        yield NOT_FOUND_MSG
-        return
-
     messages = _build_prompt(context, question, history)
 
     try:
@@ -100,7 +89,7 @@ def ask_llm_stream(context: str, question: str, history: Optional[list[dict]] = 
                 produced_any = True
                 yield chunk.content
         if not produced_any:
-            yield NOT_FOUND_MSG
+            yield "I couldn't generate a response."
     except Exception:
         logger.exception("LLM streaming generation failed")
         yield "The assistant hit an error while generating a response. Please check your GROQ_API_KEY."
