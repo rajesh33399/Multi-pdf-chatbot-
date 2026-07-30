@@ -1,108 +1,46 @@
 """
-llm.py — Local LLM orchestration (TinyLlama via ctransformers).
-
-- Lazily loads the model on first use and auto-downloads the GGUF weights
-  from the Hugging Face Hub if they aren't already on disk.
-- Serializes access to the shared model with a lock, since ctransformers
-  is not safe for concurrent generate() calls on one instance, and Streamlit
-  can serve multiple sessions from the same process.
-- Fully generic strict-RAG prompting — no document-type-specific parsing.
+llm.py — Cloud LLM orchestration using Groq API (Lightning Fast & Free).
 """
 
 import logging
 import os
-import re
-import threading
-import time
 from typing import Iterator, Optional
 
-from huggingface_hub import hf_hub_download
-# SWAPPED: Using CTransformers instead of llama_cpp
-from langchain_community.llms import CTransformers
+from langchain_groq import ChatGroq
 
 logger = logging.getLogger(__name__)
 
 # ----------------------------------------------------
-# Configuration (override via environment variables)
+# Configuration
 # ----------------------------------------------------
-MODEL_REPO_ID = os.environ.get("MODEL_REPO_ID", "TheBloke/TinyLlama-1.1B-Chat-v1.0-GGUF")
-MODEL_FILENAME = os.environ.get("MODEL_FILENAME", "tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf")
-MODEL_DIR = os.environ.get("MODEL_DIR", "models")
-MODEL_PATH = os.path.join(MODEL_DIR, MODEL_FILENAME)
-
-N_CTX = int(os.environ.get("LLM_N_CTX", "2048"))
-N_THREADS = int(os.environ.get("LLM_N_THREADS", "6"))
-N_BATCH = int(os.environ.get("LLM_N_BATCH", "32"))
-
+# Using Groq's fast and free Llama 3.1 8B model
+MODEL_NAME = os.environ.get("GROQ_MODEL", "llama-3.1-8b-instant")
 MAX_CONTEXT_CHARS = int(os.environ.get("MAX_CONTEXT_CHARS", "3500"))
 MAX_HISTORY_CHARS = int(os.environ.get("MAX_HISTORY_CHARS", "400"))
-MAX_OUTPUT_TOKENS = int(os.environ.get("LLM_MAX_TOKENS", "128"))
+MAX_OUTPUT_TOKENS = int(os.environ.get("LLM_MAX_TOKENS", "512"))
 
 NOT_FOUND_MSG = "Information not found in uploaded documents."
 
 # ----------------------------------------------------
-# Thread-safe lazy singleton
+# LLM Singleton
 # ----------------------------------------------------
-_llm_instance: Optional[CTransformers] = None
-_load_lock = threading.Lock()
-_inference_lock = threading.Lock()  # serializes calls across sessions
-
-
-def _ensure_model_downloaded() -> str:
-    """Download the GGUF from the Hub if it isn't already on disk."""
-    if os.path.exists(MODEL_PATH):
-        return MODEL_PATH
-
-    os.makedirs(MODEL_DIR, exist_ok=True)
-    logger.info("Model not found locally, downloading %s/%s ...", MODEL_REPO_ID, MODEL_FILENAME)
-    downloaded_path = hf_hub_download(
-        repo_id=MODEL_REPO_ID,
-        filename=MODEL_FILENAME,
-        local_dir=MODEL_DIR,
+def get_llm() -> ChatGroq:
+    """Return the ChatGroq instance using the API key from environment variables."""
+    api_key = os.environ.get("GROQ_API_KEY")
+    if not api_key:
+        raise ValueError("GROQ_API_KEY environment variable is not set!")
+    
+    return ChatGroq(
+        model=MODEL_NAME,
+        temperature=0.1,
+        max_tokens=MAX_OUTPUT_TOKENS,
+        api_key=api_key
     )
-    logger.info("Model downloaded to %s", downloaded_path)
-    return downloaded_path
-
-
-def get_llm() -> CTransformers:
-    """Return the shared CTransformers instance, loading (and downloading, if needed) it
-    on first use."""
-    global _llm_instance
-
-    if _llm_instance is not None:
-        return _llm_instance
-
-    with _load_lock:
-        if _llm_instance is None:  # re-check inside the lock
-            model_path = _ensure_model_downloaded()
-            logger.info(
-                "Loading TinyLlama from %s (n_ctx=%s, n_threads=%s)",
-                model_path, N_CTX, N_THREADS,
-            )
-
-            _llm_instance = CTransformers(
-                model=model_path,
-                model_type="llama",
-                config={
-                    'max_new_tokens': MAX_OUTPUT_TOKENS,
-                    'temperature': 0.1,
-                    'top_p': 0.1,
-                    'repetition_penalty': 1.1,
-                    'context_length': N_CTX,
-                    'threads': N_THREADS,
-                    'batch_size': N_BATCH
-                }
-            )
-            logger.info("TinyLlama loaded and ready.")
-    return _llm_instance
-
 
 # ----------------------------------------------------
-# Prompt construction — optimized for small LLMs (TinyLlama)
+# Prompt construction
 # ----------------------------------------------------
-def _build_prompt(context: str, question: str, history: Optional[list[dict]] = None) -> str:
-    # FIXED: Replaced aggressive whitespace flattening (re.sub(r"\s+", " ")) 
-    # which previously destroyed multi-line code blocks, YAML files, and lists.
+def _build_prompt(context: str, question: str, history: Optional[list[dict]] = None) -> list:
     context = context.strip()[:MAX_CONTEXT_CHARS]
 
     history_block = ""
@@ -113,16 +51,17 @@ def _build_prompt(context: str, question: str, history: Optional[list[dict]] = N
             snippet = f"Previous question: {last_user}\nPrevious answer: {last_assistant}\n"
             history_block = snippet[:MAX_HISTORY_CHARS]
 
-    return f"""<|system|>
-You are a helpful document assistant. Answer the question using only the provided context. If the answer is not in the context, reply with "{NOT_FOUND_MSG}".
+    system_prompt = (
+        "You are a helpful document assistant. Answer the question using only the provided context. "
+        f'If the answer is not in the context, reply with "{NOT_FOUND_MSG}".'
+    )
+    
+    user_prompt = f"{history_block}Context:\n{context}\n\nQuestion: {question}"
 
-<|user|>
-{history_block}Context:
-{context}
-
-Question: {question}
-
-<|assistant|>"""
+    return [
+        ("system", system_prompt),
+        ("human", user_prompt)
+    ]
 
 
 def ask_llm(context: str, question: str, history: Optional[list[dict]] = None) -> str:
@@ -130,50 +69,38 @@ def ask_llm(context: str, question: str, history: Optional[list[dict]] = None) -
     if not context or not context.strip():
         return NOT_FOUND_MSG
 
-    prompt = _build_prompt(context, question, history)
+    messages = _build_prompt(context, question, history)
 
-    t0 = time.time()
     try:
         llm = get_llm()
-        with _inference_lock:
-            answer = llm.invoke(prompt).strip()
-        logger.info("LLM generation took %.1fs", time.time() - t0)
+        response = llm.invoke(messages)
+        answer = response.content.strip()
     except Exception:
         logger.exception("LLM generation failed")
-        return "The assistant hit an error while generating a response. Please try again."
+        return "The assistant hit an error while generating a response. Please check your GROQ_API_KEY."
 
-    if len(answer) < 3:
+    if len(answer) < 2:
         return NOT_FOUND_MSG
     return answer
 
 
 def ask_llm_stream(context: str, question: str, history: Optional[list[dict]] = None) -> Iterator[str]:
-    """Generator — yields text chunks as they're produced."""
+    """Generator — yields text chunks as they're produced for token-by-token streaming."""
     if not context or not context.strip():
         yield NOT_FOUND_MSG
         return
 
-    prompt = _build_prompt(context, question, history)
+    messages = _build_prompt(context, question, history)
 
-    t0 = time.time()
-    logger.info("Starting streaming generation...")
     try:
         llm = get_llm()
-        with _inference_lock:
-            produced_any = False
-            first_token_logged = False
-            for token in llm.stream(prompt):
-                if token:
-                    if any(stop in token for stop in ["<|user|>", "<|system|>", "Question:"]):
-                        break
-                    if not first_token_logged:
-                        logger.info("First token after %.1fs", time.time() - t0)
-                        first_token_logged = True
-                    produced_any = True
-                    yield token
-        logger.info("Streaming generation finished in %.1fs", time.time() - t0)
+        produced_any = False
+        for chunk in llm.stream(messages):
+            if chunk.content:
+                produced_any = True
+                yield chunk.content
         if not produced_any:
             yield NOT_FOUND_MSG
     except Exception:
         logger.exception("LLM streaming generation failed")
-        yield "The assistant hit an error while generating a response. Please try again."
+        yield "The assistant hit an error while generating a response. Please check your GROQ_API_KEY."
