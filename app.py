@@ -1,16 +1,16 @@
 """
-app.py — Forced full-width layout with explicit visible sidebar structure.
+app.py — Exact Gemini layout with collapsible icon sidebar.
 """
 
 import streamlit as st
 from llm import ask_llm_stream
 
-# Page configuration
+# Page configuration with collapsed sidebar state
 st.set_page_config(
     page_title="SparkAI",
     page_icon="✨",
     layout="wide",
-    initial_sidebar_state="expanded"
+    initial_sidebar_state="collapsed"
 )
 
 # Initialize session state variables
@@ -21,26 +21,34 @@ if "current_chat" not in st.session_state:
 if "recent_chats" not in st.session_state:
     st.session_state.recent_chats = []
 
-# Clean CSS to ensure sidebar and header are never hidden
+# Custom CSS for clean layout styling and icon look
 st.markdown("""
     <style>
+    .stApp {
+        background-color: #ffffff;
+        color: #1f1f1f;
+    }
     [data-testid="stSidebar"] {
-        display: block !important;
-        visibility: visible !important;
         background-color: #f8f9fa;
         border-right: 1px solid #e0e0e0;
+        padding-top: 10px;
     }
-    [data-testid="collapsedControl"] {
-        display: block !important;
-    }
+    #MainMenu {visibility: hidden;}
+    footer {visibility: hidden;}
+    header {visibility: hidden;}
     </style>
 """, unsafe_allow_html=True)
 
 # -------------------------------------------------------------------------
-# Sidebar Layout (Explicitly defined)
+# Sidebar Layout
 # -------------------------------------------------------------------------
 with st.sidebar:
-    st.markdown("### ✨ SparkAI")
+    col_logo, col_title = st.columns([1, 4])
+    with col_logo:
+        st.markdown("### ✨")
+    with col_title:
+        st.markdown("### SparkAI")
+    
     st.markdown("---")
     
     if st.button("New chat", key="btn_new", use_container_width=True):
@@ -48,14 +56,23 @@ with st.sidebar:
         st.session_state.current_chat = "New chat"
         st.rerun()
 
-    st.markdown("### Recent Chats")
+    if st.button("Search chats", key="btn_search", use_container_width=True):
+        st.toast("Search feature coming soon!")
+
+    if st.button("Library", key="btn_library", use_container_width=True):
+        st.toast("Library view selected")
+        
+    st.markdown("### Notebooks")
+    if st.button("➕ New notebook", use_container_width=True):
+        st.toast("Notebook created!")
+        
+    st.markdown("### Recent")
     for chat in st.session_state.recent_chats:
         if st.button(chat, key=f"chat_{chat}", use_container_width=True):
             st.session_state.current_chat = chat
             st.rerun()
 
     st.markdown("---")
-    st.caption("Sidebar controls active")
 
 # -------------------------------------------------------------------------
 # Main Chat Area
