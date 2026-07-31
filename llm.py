@@ -15,8 +15,7 @@ logger = logging.getLogger(__name__)
 # ----------------------------------------------------
 # Configuration
 # ----------------------------------------------------
-# You can choose your provider: "groq" or "gemini"
-AI_PROVIDER = os.environ.get("AI_PROVIDER", "groq") # Change to "gemini" if you want to use Gemini by default
+AI_PROVIDER = os.environ.get("AI_PROVIDER", "groq")
 
 MODEL_NAME = os.environ.get("GROQ_MODEL", "llama-3.1-8b-instant")
 MAX_CONTEXT_CHARS = int(os.environ.get("MAX_CONTEXT_CHARS", "3500"))
@@ -82,7 +81,6 @@ def ask_llm_stream(context: str, question: str, history: Optional[list[dict]] = 
             return
 
         genai.configure(api_key=gemini_api_key)
-        # Using Gemini 1.5 Flash for fast streaming responses
         model = genai.GenerativeModel(
             model_name="gemini-1.5-flash",
             system_instruction=system_prompt
@@ -105,3 +103,11 @@ def ask_llm_stream(context: str, question: str, history: Optional[list[dict]] = 
 def ask_llm(context: str, question: str, history: Optional[list[dict]] = None) -> str:
     """Blocking call — returns the full answer as a string by consuming the stream."""
     return "".join(list(ask_llm_stream(context, question, history)))
+
+
+# ----------------------------------------------------
+# Compatibility Wrapper
+# ----------------------------------------------------
+def get_llm():
+    """Compatibility wrapper so app.py imports don't break."""
+    return None
