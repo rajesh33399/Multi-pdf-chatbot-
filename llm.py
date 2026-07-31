@@ -1,14 +1,22 @@
 """
-llm.py — Cloud LLM orchestration supporting Groq and Gemini via Streamlit Secrets.
+llm.py — Cloud AI orchestration: Groq + Gemini (text) via LangChain/google-genai,
+plus Gemini image generation (Nano Banana) and video generation (Veo).
+
+NOTE ON SDK MIGRATION: this file previously used `google.generativeai`, which
+Google deprecated on Nov 30, 2025 and does not support image/video generation
+at all. It has been migrated to the current unified `google-genai` SDK
+(`from google import genai`), which is required for Nano Banana / Veo access.
 """
 
 import logging
 import os
-import streamlit as st
+import time
 from typing import Iterator, Optional
 
+import streamlit as st
 from langchain_groq import ChatGroq
-import google.generativeai as genai
+from google import genai
+from google.genai import types
 
 logger = logging.getLogger(__name__)
 
@@ -17,13 +25,53 @@ logger = logging.getLogger(__name__)
 # ----------------------------------------------------
 AI_PROVIDER = os.environ.get("AI_PROVIDER", "groq")
 
-MODEL_NAME = os.environ.get("GROQ_MODEL", "llama-3.1-8b-instant")
+GROQ_MODEL = os.environ.get("GROQ_MODEL", "llama-3.1-8b-instant")
+# Current GA flash model as of mid-2026. Override via env var if Google ships
+# a newer default before this code is updated again.
+GEMINI_TEXT_MODEL = os.environ.get("GEMINI_TEXT_MODEL", "gemini-3.6-flash")
+# "Nano Banana" — Google's own migration guidance is to use this native
+# multimodal model via generate_content, NOT the deprecated Imagen endpoint.
+GEMINI_IMAGE_MODEL = os.environ.get("GEMINI_IMAGE_MODEL", "gemini-2.5-flash-image")
+# Veo 3.1 preview — the 2.0/3.0 model lines were shut down June 30, 2026.
+GEMINI_VIDEO_MODEL = os.environ.get("GEMINI_VIDEO_MODEL", "veo-3.1-generate-preview")
+
 MAX_CONTEXT_CHARS = int(os.environ.get("MAX_CONTEXT_CHARS", "3500"))
 MAX_HISTORY_CHARS = int(os.environ.get("MAX_HISTORY_CHARS", "400"))
 MAX_OUTPUT_TOKENS = int(os.environ.get("LLM_MAX_TOKENS", "512"))
 
+VIDEO_POLL_SECONDS = int(os.environ.get("VIDEO_POLL_SECONDS", "10"))
+VIDEO_MAX_WAIT_SECONDS = int(os.environ.get("VIDEO_MAX_WAIT_SECONDS", "300"))
+
+
+class VideoGenerationUnavailable(Exception):
+    """Raised when the configured API key/plan can't access video generation.
+    app.py should catch this specifically and show a clear, honest message
+    instead of a generic error — Veo access is gated by Google independently
+    of anything in this code."""
+
+
 # ----------------------------------------------------
-# Prompt construction (Shared)
+# Gemini client (cached — one client per process, not per call)
+# ----------------------------------------------------
+_gemini_client: Optional["genai.Client"] = None
+
+
+def _get_gemini_api_key() -> Optional[str]:
+    return st.secrets.get("GEMINI_API_KEY") or os.environ.get("GEMINI_API_KEY")
+
+
+def _get_gemini_client() -> "genai.Client":
+    global _gemini_client
+    if _gemini_client is None:
+        api_key = _get_gemini_api_key()
+        if not api_key:
+            raise RuntimeError("GEMINI_API_KEY is not configured in Streamlit secrets.")
+        _gemini_client = genai.Client(api_key=api_key)
+    return _gemini_client
+
+
+# ----------------------------------------------------
+# Prompt construction (unchanged from before)
 # ----------------------------------------------------
 def _build_prompt(context: str, question: str, history: Optional[list[dict]] = None) -> tuple:
     context = context.strip()[:MAX_CONTEXT_CHARS]
@@ -36,7 +84,6 @@ def _build_prompt(context: str, question: str, history: Optional[list[dict]] = N
             snippet = f"Previous question: {last_user}\nPrevious answer: {last_assistant}\n"
             history_block = snippet[:MAX_HISTORY_CHARS]
 
-    # Dynamically structure prompt based on whether document context exists
     if context:
         system_prompt = (
             "You are a helpful AI assistant. Use the provided document context to answer the question accurately."
@@ -53,18 +100,17 @@ def _build_prompt(context: str, question: str, history: Optional[list[dict]] = N
 
 
 # ----------------------------------------------------
-# LLM Streaming & Blocking Implementation
+# Text chat: Groq first, Gemini fallback
 # ----------------------------------------------------
 def ask_llm_stream(context: str, question: str, history: Optional[list[dict]] = None) -> Iterator[str]:
     """Generator — yields text chunks using Groq or Gemini based on configuration/keys."""
     system_prompt, user_prompt = _build_prompt(context, question, history)
-    
-    # Try using Groq first if available in secrets
+
     try:
         groq_api_key = st.secrets.get("GROQ_API_KEY") or os.environ.get("GROQ_API_KEY")
         if groq_api_key and AI_PROVIDER == "groq":
             llm = ChatGroq(
-                model=MODEL_NAME,
+                model=GROQ_MODEL,
                 temperature=0.1,
                 max_tokens=MAX_OUTPUT_TOKENS,
                 api_key=groq_api_key
@@ -80,36 +126,104 @@ def ask_llm_stream(context: str, question: str, history: Optional[list[dict]] = 
     except Exception:
         logger.warning("Groq failed or unavailable, trying fallback/Gemini...")
 
-    # Fallback to Gemini if Groq isn't used or fails
     try:
-        gemini_api_key = st.secrets.get("GEMINI_API_KEY") or os.environ.get("GEMINI_API_KEY")
-        if not gemini_api_key:
-            yield "Error: Neither GROQ_API_KEY nor GEMINI_API_KEY is configured in Streamlit secrets!"
-            return
+        client = _get_gemini_client()
+    except Exception as e:
+        yield f"Error: {e}"
+        return
 
-        genai.configure(api_key=gemini_api_key)
-        model = genai.GenerativeModel(
-            model_name="gemini-1.5-flash",
-            system_instruction=system_prompt
-        )
-        
-        response = model.generate_content(user_prompt, stream=True)
+    try:
         produced_any = False
-        for chunk in response:
+        for chunk in client.models.generate_content_stream(
+            model=GEMINI_TEXT_MODEL,
+            contents=user_prompt,
+            config=types.GenerateContentConfig(system_instruction=system_prompt),
+        ):
             if chunk.text:
                 produced_any = True
                 yield chunk.text
         if not produced_any:
             yield "I couldn't generate a response."
-            
     except Exception:
-        logger.exception("LLM streaming generation failed completely")
+        logger.exception("Gemini text generation failed")
         yield "The assistant hit an error while generating a response. Please check your API keys in Streamlit secrets."
 
 
 def ask_llm(context: str, question: str, history: Optional[list[dict]] = None) -> str:
     """Blocking call — returns the full answer as a string by consuming the stream."""
     return "".join(list(ask_llm_stream(context, question, history)))
+
+
+# ----------------------------------------------------
+# Image generation (Gemini "Nano Banana") — always via Gemini,
+# regardless of AI_PROVIDER, since Groq has no image generation.
+# ----------------------------------------------------
+def generate_image(prompt: str) -> bytes:
+    """Generate an image from a text prompt. Returns raw image bytes (PNG/JPEG)."""
+    client = _get_gemini_client()
+    response = client.models.generate_content(
+        model=GEMINI_IMAGE_MODEL,
+        contents=prompt,
+        config=types.GenerateContentConfig(response_modalities=["Text", "Image"]),
+    )
+    candidates = getattr(response, "candidates", None) or []
+    if not candidates:
+        raise RuntimeError("Gemini returned no candidates for this image prompt.")
+    parts = getattr(candidates[0].content, "parts", None) or []
+    for part in parts:
+        inline_data = getattr(part, "inline_data", None)
+        if inline_data is not None and inline_data.data:
+            return inline_data.data
+    raise RuntimeError("Gemini did not return image data for this prompt — try rephrasing it.")
+
+
+# ----------------------------------------------------
+# Video generation (Veo) — always via Gemini. Async: submit, poll, retrieve.
+# ----------------------------------------------------
+def generate_video(prompt: str) -> bytes:
+    """Generate a video from a text prompt. BLOCKING — polls until the async
+    job completes or times out. Returns raw MP4 bytes.
+
+    Raises VideoGenerationUnavailable if the API key/plan can't reach Veo
+    (this is gated by Google independently of this code — a paid/allowlisted
+    tier may be required). Callers should catch this specifically and show a
+    plain "not available on your plan" message rather than a generic error.
+    """
+    client = _get_gemini_client()
+
+    try:
+        operation = client.models.generate_videos(
+            model=GEMINI_VIDEO_MODEL,
+            prompt=prompt,
+            config=types.GenerateVideosConfig(number_of_videos=1, duration_seconds=5),
+        )
+    except Exception as e:
+        msg = str(e)
+        if any(s in msg for s in ("PERMISSION_DENIED", "403", "not allowed", "not enabled", "quota")):
+            raise VideoGenerationUnavailable(
+                "Video generation isn't available on your current Gemini API plan/key."
+            ) from e
+        raise
+
+    waited = 0
+    while not operation.done:
+        if waited >= VIDEO_MAX_WAIT_SECONDS:
+            raise TimeoutError(
+                f"Video generation exceeded the {VIDEO_MAX_WAIT_SECONDS}s wait limit and timed out."
+            )
+        time.sleep(VIDEO_POLL_SECONDS)
+        waited += VIDEO_POLL_SECONDS
+        operation = client.operations.get(operation)
+
+    generated = getattr(operation.response, "generated_videos", None) or []
+    if not generated:
+        raise RuntimeError("Gemini did not return a video for this prompt — try rephrasing it.")
+
+    video_obj = generated[0].video
+    video_bytes = getattr(video_obj, "video_bytes", None)
+    if video_bytes:
+        return video_bytes
+    raise RuntimeError("Could not read generated video bytes from the API response.")
 
 
 # ----------------------------------------------------
