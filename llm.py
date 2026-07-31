@@ -36,14 +36,18 @@ def _build_prompt(context: str, question: str, history: Optional[list[dict]] = N
             snippet = f"Previous question: {last_user}\nPrevious answer: {last_assistant}\n"
             history_block = snippet[:MAX_HISTORY_CHARS]
 
-    system_prompt = (
-        "You are a helpful AI assistant. If relevant document context is provided below, "
-        "use it to answer the question accurately. If no context is provided or if the question is general, "
-        "rely entirely on your own general knowledge and training to provide a clear, direct, and complete response "
-        "without referencing missing documents or past context."
-    )
-    
-    user_prompt = f"{history_block}Context:\n{context}\n\nQuestion: {question}"
+    # Dynamically structure prompt based on whether document context exists
+    if context:
+        system_prompt = (
+            "You are a helpful AI assistant. Use the provided document context to answer the question accurately."
+        )
+        user_prompt = f"{history_block}Context:\n{context}\n\nQuestion: {question}"
+    else:
+        system_prompt = (
+            "You are a helpful AI assistant. Answer the user's questions clearly, directly, and accurately using your general knowledge."
+        )
+        user_prompt = f"{history_block}Question: {question}"
+
     return system_prompt, user_prompt
 
 
