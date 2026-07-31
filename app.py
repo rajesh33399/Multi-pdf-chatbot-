@@ -47,7 +47,7 @@ def load_reranker() -> CrossEncoder:
     return CrossEncoder(RERANKER_MODEL_NAME)
 
 
-@st.cache_resource(show_spinner="🤖 Loading local AI model (first run downloads ~650MB, please wait)...")
+@st.cache_resource(show_spinner="🤖 Loading local AI model...")
 def warm_up_llm() -> bool:
     get_llm()
     return True
@@ -182,10 +182,8 @@ for key, default in [
 # Sidebar — SparkChat Interface
 # ----------------------------------------------------
 with st.sidebar:
-    # Top Logo and SparkChat Name Side-by-Side
     col_logo, col_title = st.columns([1, 3])
     with col_logo:
-        # Ensure your Variation 1 logo image file is named this or change accordingly
         st.image("variation1_teal_logo.png", width=40)
     with col_title:
         st.markdown("<h3 style='margin: 0; padding-top: 4px;'>SparkChat</h3>", unsafe_allow_html=True)
@@ -207,7 +205,6 @@ with st.sidebar:
     # 3. Recent section with Pin & Three-Dot Menu Options
     st.markdown("**Recent**")
 
-    # Handle rename state interface if triggered
     if st.session_state.renaming_chat:
         st.write(f"Renaming: *{st.session_state.renaming_chat}*")
         new_title = st.text_input("New name", value=st.session_state.renaming_chat, key="rename_input")
@@ -226,13 +223,11 @@ with st.sidebar:
                 st.rerun()
         st.markdown("---")
 
-    # List recent chats with action buttons
     for chat_title in list(st.session_state.chats.keys()):
         if st.session_state.search_query.lower() in chat_title.lower():
             is_active = (chat_title == st.session_state.current_chat)
             is_pinned = chat_title in st.session_state.pinned_chats
             
-            # Row layout for chat item name, pin indicator, and options menu
             c_chat, c_pin, c_menu = st.columns([0.62, 0.18, 0.20])
             
             with c_chat:
@@ -251,7 +246,6 @@ with st.sidebar:
                     st.rerun()
             
             with c_menu:
-                # Popover acting as the three dots menu (...) containing Share, Rename, Pin, Archive, Delete
                 with st.popover("⋮", help="More options"):
                     st.markdown(f"**{chat_title}**")
                     
@@ -382,15 +376,13 @@ with st.sidebar:
 # Main Chat Window Header
 # ----------------------------------------------------
 st.title("⚡ SparkChat")
-st.caption("Chat with multiple documents using local AI & RAG.")
+st.caption("Chat freely with AI, or upload documents for RAG search.")
 
-# Get current chat message history list
 if st.session_state.current_chat not in st.session_state.chats:
     st.session_state.chats[st.session_state.current_chat] = []
 
 current_messages = st.session_state.chats[st.session_state.current_chat]
 
-# Render chat history for current session
 for message in current_messages:
     with st.chat_message(message["role"]):
         st.markdown(message["content"])
@@ -399,14 +391,19 @@ for message in current_messages:
                 render_sources(message["sources"])
 
 # ----------------------------------------------------
-# Chat Input & RAG Execution
+# Chat Input & Unrestricted Execution
 # ----------------------------------------------------
-question = st.chat_input("Ask something across your documents...")
+question = st.chat_input("Ask a question or search your documents...")
 
 if question:
-    if st.session_state.vector_store is None:
-        st.error("Please upload at least one document in the sidebar first.")
-        st.stop()
+    results = []
+    context = ""
+
+    # Only perform RAG search if documents have been uploaded and processed
+    if st.session_state.vector_store is not None and st.session_state.all_documents:
+        with st.spinner("🔎 Searching documents..."):
+            results = retrieve_documents(question, st.session_state.all_documents, st.session_state.vector_store)
+        context = build_context(results)
 
     with st.chat_message("user"):
         st.markdown(question)
@@ -414,19 +411,9 @@ if question:
 
     history_for_llm = current_messages[:-1]
 
-    with st.spinner("🔎 Searching documents..."):
-        results = retrieve_documents(question, st.session_state.all_documents, st.session_state.vector_store)
-
-    context = build_context(results)
-
     with st.chat_message("assistant"):
-        if not context.strip():
-            answer = "Information not found in uploaded documents."
-            st.markdown(answer)
-        else:
-            with st.spinner("🤖 Loading local AI model (first question only, please wait)..."):
-                warm_up_llm()
-            answer = st.write_stream(ask_llm_stream(context, question, history=history_for_llm))
+        warm_up_llm()
+        answer = st.write_stream(ask_llm_stream(context, question, history=history_for_llm))
 
         if results:
             with st.expander("View sources"):
