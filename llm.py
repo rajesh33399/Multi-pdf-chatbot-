@@ -44,7 +44,8 @@ def _build_prompt(context: str, question: str, history: Optional[list[dict]] = N
         user_prompt = f"{history_block}Context:\n{context}\n\nQuestion: {question}"
     else:
         system_prompt = (
-            "You are a helpful AI assistant. Answer the user's questions clearly, directly, and accurately using your general knowledge."
+            "You are a concise, direct, and factual AI assistant. Answer the user's questions clearly "
+            "and accurately using your general knowledge without repeating yourself or stuttering."
         )
         user_prompt = f"{history_block}Question: {question}"
 
