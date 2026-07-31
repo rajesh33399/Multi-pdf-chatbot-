@@ -87,7 +87,9 @@ st.markdown("""
     }
     #MainMenu {visibility: hidden;}
     footer {visibility: hidden;}
-    header {visibility: hidden;}
+    /* NOTE: header is intentionally NOT hidden — it contains Streamlit's
+       sidebar expand/collapse arrow. Hiding it makes the sidebar
+       impossible to reopen once collapsed, with no way back. */
     </style>
 """, unsafe_allow_html=True)
 
