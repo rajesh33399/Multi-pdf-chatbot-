@@ -50,6 +50,27 @@ class VideoGenerationUnavailable(Exception):
     of anything in this code."""
 
 
+class ImageGenerationUnavailable(Exception):
+    """Raised when the configured API key/plan can't access image generation
+    (e.g. free-tier keys currently get a quota of 0 for gemini-2.5-flash-image).
+    app.py should catch this specifically and show a clear, honest message
+    rather than the raw API error."""
+
+
+class ImageGenerationUnavailable(Exception):
+    """Raised when the configured API key/plan has zero quota for image
+    generation (e.g. free-tier keys with limit: 0 on gemini-*-image models).
+    This is a Google-side billing/plan restriction, not a bug — app.py
+    should show a clear, honest message instead of the raw API error."""
+
+
+def _is_quota_or_permission_error(msg: str) -> bool:
+    return any(s in msg for s in (
+        "PERMISSION_DENIED", "403", "not allowed", "not enabled",
+        "quota", "RESOURCE_EXHAUSTED", "429",
+    ))
+
+
 # ----------------------------------------------------
 # Gemini client (cached — one client per process, not per call)
 # ----------------------------------------------------
@@ -159,13 +180,31 @@ def ask_llm(context: str, question: str, history: Optional[list[dict]] = None) -
 # regardless of AI_PROVIDER, since Groq has no image generation.
 # ----------------------------------------------------
 def generate_image(prompt: str) -> bytes:
-    """Generate an image from a text prompt. Returns raw image bytes (PNG/JPEG)."""
+    """Generate an image from a text prompt. Returns raw image bytes (PNG/JPEG).
+
+    Raises ImageGenerationUnavailable if the API key/plan has no quota for
+    image generation — as of mid-2026, Google's free Gemini API tier gives
+    a quota of 0 requests/day for gemini-2.5-flash-image, so this requires
+    a paid plan with billing enabled. Callers should catch this specifically
+    and show a plain message rather than the raw API error.
+    """
     client = _get_gemini_client()
-    response = client.models.generate_content(
-        model=GEMINI_IMAGE_MODEL,
-        contents=prompt,
-        config=types.GenerateContentConfig(response_modalities=["Text", "Image"]),
-    )
+    try:
+        response = client.models.generate_content(
+            model=GEMINI_IMAGE_MODEL,
+            contents=prompt,
+            config=types.GenerateContentConfig(response_modalities=["Text", "Image"]),
+        )
+    except Exception as e:
+        msg = str(e)
+        if any(s in msg for s in ("RESOURCE_EXHAUSTED", "429", "quota", "PERMISSION_DENIED")):
+            raise ImageGenerationUnavailable(
+                "Image generation isn't available on your current Gemini API plan. "
+                "Free-tier keys currently have zero quota for image generation — "
+                "this needs a paid Gemini API plan with billing enabled."
+            ) from e
+        raise
+
     candidates = getattr(response, "candidates", None) or []
     if not candidates:
         raise RuntimeError("Gemini returned no candidates for this image prompt.")
