@@ -1,5 +1,5 @@
 """
-app.py — SparkChat frontend featuring explicit sidebar controls and recovery layout.
+app.py — Forced full-width layout with explicit visible sidebar structure.
 """
 
 import streamlit as st
@@ -21,34 +21,26 @@ if "current_chat" not in st.session_state:
 if "recent_chats" not in st.session_state:
     st.session_state.recent_chats = []
 
-# Custom CSS to guarantee layout rendering
+# Clean CSS to ensure sidebar and header are never hidden
 st.markdown("""
     <style>
-    .stApp {
-        background-color: #ffffff;
-        color: #1f1f1f;
-    }
     [data-testid="stSidebar"] {
+        display: block !important;
+        visibility: visible !important;
         background-color: #f8f9fa;
         border-right: 1px solid #e0e0e0;
-        padding-top: 10px;
     }
-    #MainMenu {visibility: hidden;}
-    footer {visibility: hidden;}
-    header {visibility: hidden;}
+    [data-testid="collapsedControl"] {
+        display: block !important;
+    }
     </style>
 """, unsafe_allow_html=True)
 
 # -------------------------------------------------------------------------
-# Sidebar Layout
+# Sidebar Layout (Explicitly defined)
 # -------------------------------------------------------------------------
 with st.sidebar:
-    col_logo, col_title = st.columns([1, 4])
-    with col_logo:
-        st.markdown("### ✨")
-    with col_title:
-        st.markdown("### SparkAI")
-    
+    st.markdown("### ✨ SparkAI")
     st.markdown("---")
     
     if st.button("New chat", key="btn_new", use_container_width=True):
@@ -56,34 +48,19 @@ with st.sidebar:
         st.session_state.current_chat = "New chat"
         st.rerun()
 
-    if st.button("Search chats", key="btn_search", use_container_width=True):
-        st.toast("Search feature coming soon!")
-
-    if st.button("Library", key="btn_library", use_container_width=True):
-        st.toast("Library view selected")
-        
-    st.markdown("### Notebooks")
-    if st.button("➕ New notebook", use_container_width=True):
-        st.toast("Notebook created!")
-        
-    st.markdown("### Recent")
+    st.markdown("### Recent Chats")
     for chat in st.session_state.recent_chats:
         if st.button(chat, key=f"chat_{chat}", use_container_width=True):
             st.session_state.current_chat = chat
             st.rerun()
 
     st.markdown("---")
+    st.caption("Sidebar controls active")
 
 # -------------------------------------------------------------------------
 # Main Chat Area
 # -------------------------------------------------------------------------
-# Top header layout to ensure navigation control is visible even if sidebar is closed
-col_head1, col_head2 = st.columns([6, 1])
-with col_head1:
-    st.markdown(f"### {st.session_state.current_chat}")
-with col_head2:
-    if st.button("📂 Toggle Sidebar", use_container_width=True):
-        st.toast("Use the top-left arrow in your browser toolbar to open/close the sidebar if needed.")
+st.markdown(f"### {st.session_state.current_chat}")
 
 for message in st.session_state.messages:
     with st.chat_message(message["role"]):
