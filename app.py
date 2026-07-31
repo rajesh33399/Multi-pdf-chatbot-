@@ -7,7 +7,10 @@ import uuid
 
 import streamlit as st
 
-from llm import ask_llm_stream, generate_image, generate_video, VideoGenerationUnavailable
+from llm import (
+    ask_llm_stream, generate_image, generate_video,
+    VideoGenerationUnavailable, ImageGenerationUnavailable,
+)
 
 st.set_page_config(
     page_title="SparkAI",
@@ -81,9 +84,20 @@ st.markdown("""
         border: none !important;
         background: transparent !important;
         font-weight: 400;
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        padding: 4px 10px !important;
+        min-height: 2.1rem !important;
     }
     [data-testid="stSidebar"] button:hover {
         background-color: #e8eaed !important;
+    }
+    [data-testid="stSidebar"] [data-testid="stPopover"] button {
+        padding: 4px 4px !important;
+    }
+    [data-testid="stSidebar"] [data-testid="column"] {
+        align-items: center;
     }
     #MainMenu {visibility: hidden;}
     footer {visibility: hidden;}
@@ -206,6 +220,17 @@ def _maybe_set_title_from_prompt(prompt: str) -> None:
         chat["title"] = (prompt[:40] + "...") if len(prompt) > 40 else prompt
 
 
+# ---- Gemini-style empty state for a brand-new, untouched chat ----
+if not chat["messages"]:
+    st.markdown("""
+        <div style="display:flex; flex-direction:column; align-items:center;
+                    justify-content:center; padding: 90px 0 60px 0; opacity: 0.85;">
+            <div style="font-size: 48px; margin-bottom: 12px;">✨</div>
+            <div style="font-size: 24px; color: #444;">Ready when you are</div>
+        </div>
+    """, unsafe_allow_html=True)
+
+
 # ---- render existing messages ----
 for message in chat["messages"]:
     msg_type = message.get("type", "text")
@@ -218,6 +243,18 @@ for message in chat["messages"]:
             st.video(message["data"])
         elif msg_type == "error":
             st.error(message["content"])
+
+# ---- "+" attachment menu (Gemini-style quick tool switcher) ----
+col_plus, col_spacer = st.columns([1, 11])
+with col_plus:
+    with st.popover("➕"):
+        st.caption("Create")
+        if st.button("🖼️ Images", key="plus_images", help="Create and edit", use_container_width=True):
+            new_chat("image")
+            st.rerun()
+        if st.button("🎬 Videos", key="plus_videos", help="Bring ideas to life", use_container_width=True):
+            new_chat("video")
+            st.rerun()
 
 # ---- input + generation, branched by mode ----
 if mode == "chat":
@@ -255,6 +292,9 @@ elif mode == "image":
                         "role": "assistant", "type": "image",
                         "data": image_bytes, "content": prompt,
                     })
+                except ImageGenerationUnavailable as e:
+                    st.error(str(e))
+                    chat["messages"].append({"role": "assistant", "type": "error", "content": str(e)})
                 except Exception as e:
                     st.error(f"Couldn't generate that image: {e}")
                     chat["messages"].append({
