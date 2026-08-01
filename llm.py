@@ -11,8 +11,10 @@ at all. It has been migrated to the current unified `google-genai` SDK
 import logging
 import os
 import time
+import urllib.parse
 from typing import Iterator, Optional
 
+import requests
 import streamlit as st
 from langchain_groq import ChatGroq
 from google import genai
@@ -48,13 +50,6 @@ class VideoGenerationUnavailable(Exception):
     app.py should catch this specifically and show a clear, honest message
     instead of a generic error — Veo access is gated by Google independently
     of anything in this code."""
-
-
-class ImageGenerationUnavailable(Exception):
-    """Raised when the configured API key/plan can't access image generation
-    (e.g. free-tier keys currently get a quota of 0 for gemini-2.5-flash-image).
-    app.py should catch this specifically and show a clear, honest message
-    rather than the raw API error."""
 
 
 class ImageGenerationUnavailable(Exception):
@@ -123,29 +118,38 @@ def _build_prompt(context: str, question: str, history: Optional[list[dict]] = N
 # ----------------------------------------------------
 # Text chat: Groq first, Gemini fallback
 # ----------------------------------------------------
-def ask_llm_stream(context: str, question: str, history: Optional[list[dict]] = None) -> Iterator[str]:
-    """Generator — yields text chunks using Groq or Gemini based on configuration/keys."""
+def ask_llm_stream(
+    context: str, question: str, history: Optional[list[dict]] = None,
+    image_bytes: Optional[bytes] = None, image_mime_type: Optional[str] = None,
+) -> Iterator[str]:
+    """Generator — yields text chunks using Groq or Gemini based on configuration/keys.
+
+    If image_bytes is provided, Groq is skipped entirely and Gemini is used
+    directly — the configured Groq model (llama-3.1-8b-instant) is text-only
+    and can't see images.
+    """
     system_prompt, user_prompt = _build_prompt(context, question, history)
 
-    try:
-        groq_api_key = st.secrets.get("GROQ_API_KEY") or os.environ.get("GROQ_API_KEY")
-        if groq_api_key and AI_PROVIDER == "groq":
-            llm = ChatGroq(
-                model=GROQ_MODEL,
-                temperature=0.1,
-                max_tokens=MAX_OUTPUT_TOKENS,
-                api_key=groq_api_key
-            )
-            messages = [("system", system_prompt), ("human", user_prompt)]
-            produced_any = False
-            for chunk in llm.stream(messages):
-                if chunk.content:
-                    produced_any = True
-                    yield chunk.content
-            if produced_any:
-                return
-    except Exception:
-        logger.warning("Groq failed or unavailable, trying fallback/Gemini...")
+    if not image_bytes:
+        try:
+            groq_api_key = st.secrets.get("GROQ_API_KEY") or os.environ.get("GROQ_API_KEY")
+            if groq_api_key and AI_PROVIDER == "groq":
+                llm = ChatGroq(
+                    model=GROQ_MODEL,
+                    temperature=0.1,
+                    max_tokens=MAX_OUTPUT_TOKENS,
+                    api_key=groq_api_key
+                )
+                messages = [("system", system_prompt), ("human", user_prompt)]
+                produced_any = False
+                for chunk in llm.stream(messages):
+                    if chunk.content:
+                        produced_any = True
+                        yield chunk.content
+                if produced_any:
+                    return
+        except Exception:
+            logger.warning("Groq failed or unavailable, trying fallback/Gemini...")
 
     try:
         client = _get_gemini_client()
@@ -154,10 +158,15 @@ def ask_llm_stream(context: str, question: str, history: Optional[list[dict]] = 
         return
 
     try:
+        if image_bytes:
+            contents = [user_prompt, types.Part.from_bytes(data=image_bytes, mime_type=image_mime_type)]
+        else:
+            contents = user_prompt
+
         produced_any = False
         for chunk in client.models.generate_content_stream(
             model=GEMINI_TEXT_MODEL,
-            contents=user_prompt,
+            contents=contents,
             config=types.GenerateContentConfig(system_instruction=system_prompt),
         ):
             if chunk.text:
@@ -176,17 +185,33 @@ def ask_llm(context: str, question: str, history: Optional[list[dict]] = None) -
 
 
 # ----------------------------------------------------
+# Free fallback: Pollinations.ai — a genuinely free, no-API-key image
+# endpoint. Lower reliability/quality than Gemini and may add a watermark,
+# but costs nothing and needs no billing account. Used automatically when
+# Gemini's image generation is unavailable (e.g. free-tier quota is 0).
+# ----------------------------------------------------
+POLLINATIONS_ENABLED = os.environ.get("POLLINATIONS_FALLBACK", "true").lower() == "true"
+
+
+def _generate_image_pollinations(prompt: str) -> bytes:
+    encoded = urllib.parse.quote(prompt)
+    url = f"https://image.pollinations.ai/prompt/{encoded}"
+    response = requests.get(url, timeout=60)
+    response.raise_for_status()
+    return response.content
+
+
+# ----------------------------------------------------
 # Image generation (Gemini "Nano Banana") — always via Gemini,
 # regardless of AI_PROVIDER, since Groq has no image generation.
 # ----------------------------------------------------
 def generate_image(prompt: str) -> bytes:
     """Generate an image from a text prompt. Returns raw image bytes (PNG/JPEG).
 
-    Raises ImageGenerationUnavailable if the API key/plan has no quota for
-    image generation — as of mid-2026, Google's free Gemini API tier gives
-    a quota of 0 requests/day for gemini-2.5-flash-image, so this requires
-    a paid plan with billing enabled. Callers should catch this specifically
-    and show a plain message rather than the raw API error.
+    Tries Gemini first. If Gemini's quota/plan blocks image generation and
+    POLLINATIONS_FALLBACK is enabled (default), silently falls back to the
+    free Pollinations.ai endpoint instead of failing outright. Only raises
+    ImageGenerationUnavailable if BOTH fail (or if the fallback is disabled).
     """
     client = _get_gemini_client()
     try:
@@ -195,25 +220,35 @@ def generate_image(prompt: str) -> bytes:
             contents=prompt,
             config=types.GenerateContentConfig(response_modalities=["Text", "Image"]),
         )
+        candidates = getattr(response, "candidates", None) or []
+        if not candidates:
+            raise RuntimeError("Gemini returned no candidates for this image prompt.")
+        parts = getattr(candidates[0].content, "parts", None) or []
+        for part in parts:
+            inline_data = getattr(part, "inline_data", None)
+            if inline_data is not None and inline_data.data:
+                return inline_data.data
+        raise RuntimeError("Gemini did not return image data for this prompt.")
     except Exception as e:
         msg = str(e)
-        if any(s in msg for s in ("RESOURCE_EXHAUSTED", "429", "quota", "PERMISSION_DENIED")):
+        if _is_quota_or_permission_error(msg):
+            if POLLINATIONS_ENABLED:
+                logger.warning("Gemini image generation unavailable (%s) — falling back to Pollinations.ai", msg)
+                try:
+                    return _generate_image_pollinations(prompt)
+                except Exception:
+                    logger.exception("Pollinations.ai fallback also failed")
+                    raise ImageGenerationUnavailable(
+                        "Image generation isn't available on your current Gemini API plan, "
+                        "and the free Pollinations.ai fallback also failed (it may be rate-limited "
+                        "right now). Try again in a moment."
+                    ) from e
             raise ImageGenerationUnavailable(
                 "Image generation isn't available on your current Gemini API plan. "
                 "Free-tier keys currently have zero quota for image generation — "
                 "this needs a paid Gemini API plan with billing enabled."
             ) from e
         raise
-
-    candidates = getattr(response, "candidates", None) or []
-    if not candidates:
-        raise RuntimeError("Gemini returned no candidates for this image prompt.")
-    parts = getattr(candidates[0].content, "parts", None) or []
-    for part in parts:
-        inline_data = getattr(part, "inline_data", None)
-        if inline_data is not None and inline_data.data:
-            return inline_data.data
-    raise RuntimeError("Gemini did not return image data for this prompt — try rephrasing it.")
 
 
 # ----------------------------------------------------
