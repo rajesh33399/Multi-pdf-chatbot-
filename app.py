@@ -1,41 +1,18 @@
 """
 app.py — SparkAI: Gemini-style layout with multi-chat sessions, image
-generation, and video generation.
+generation, video generation, and document (PDF/TXT) upload for RAG.
 """
 import io
 import time
 import uuid
 
 import streamlit as st
+from pypdf import PdfReader
 
 from llm import (
     ask_llm_stream, generate_image, generate_video,
     VideoGenerationUnavailable, ImageGenerationUnavailable,
 )
-
-# Native Gemini binary support: images + PDF. Everything else (.txt, .docx)
-# gets its text extracted locally and folded into the prompt as context —
-# Gemini's API does NOT natively parse raw .docx bytes the way it does PDFs.
-NATIVE_BINARY_MIME_PREFIXES = ("image/", "application/pdf")
-
-
-def _extract_attachment_text(attachment: dict) -> str:
-    """Extract plain text from a .txt or .docx attachment. Returns '' on failure."""
-    name_lower = attachment["name"].lower()
-    try:
-        if name_lower.endswith(".txt"):
-            return attachment["bytes"].decode("utf-8", errors="ignore")
-        if name_lower.endswith(".docx"):
-            import docx  # python-docx
-            document = docx.Document(io.BytesIO(attachment["bytes"]))
-            return "\n".join(p.text for p in document.paragraphs if p.text.strip())
-    except Exception:
-        pass
-    return ""
-
-
-def _is_native_binary(attachment: dict) -> bool:
-    return attachment["mime"].startswith(NATIVE_BINARY_MIME_PREFIXES)
 
 st.set_page_config(
     page_title="SparkAI",
@@ -46,9 +23,8 @@ st.set_page_config(
 
 # -------------------------------------------------------------------------
 # Session state — each chat is its own entry: {title, messages, pinned,
-# mode, created}. This replaces the old single shared `messages` list, which
-# meant clicking a "Recent" chat only relabeled the header without actually
-# restoring that conversation's messages.
+# mode, created, context}. `context` holds extracted text from any files
+# the user has uploaded into this chat, and gets passed to the LLM.
 # -------------------------------------------------------------------------
 if "chats" not in st.session_state:
     st.session_state.chats = {}
@@ -70,6 +46,8 @@ def new_chat(mode: str = "chat") -> str:
         "pinned": False,
         "mode": mode,
         "created": time.time(),
+        "context": "",
+        "uploaded_files": [],
     }
     st.session_state.current_chat_id = chat_id
     return chat_id
@@ -88,6 +66,23 @@ def switch_to(chat_id: str) -> None:
     st.session_state.confirm_delete_id = None
 
 
+def extract_text_from_upload(uploaded_file) -> str:
+    """Best-effort text extraction. PDFs via pypdf, everything else as
+    plain text. Returns '' (never raises) so one bad file can't crash
+    the chat — the caller is responsible for telling the user if
+    extraction came back empty."""
+    name = uploaded_file.name.lower()
+    raw = uploaded_file.read()
+    try:
+        if name.endswith(".pdf"):
+            reader = PdfReader(io.BytesIO(raw))
+            pages = [page.extract_text() or "" for page in reader.pages]
+            return "\n".join(pages).strip()
+        return raw.decode("utf-8", errors="ignore").strip()
+    except Exception:
+        return ""
+
+
 # Bootstrap the very first chat on cold start
 if not st.session_state.chats:
     new_chat("chat")
@@ -98,14 +93,27 @@ if not st.session_state.chats:
 st.markdown("""
     <style>
     .stApp { background-color: #ffffff; color: #1f1f1f; }
+
+    /* ---- Sidebar base ---- */
     [data-testid="stSidebar"] {
-        background-color: #f8f9fa;
+        background-color: #f8f9fa !important;
         border-right: 1px solid #e0e0e0;
         padding-top: 10px;
     }
+
+    /* Force readable text regardless of the visitor's light/dark browser
+       preference. config.toml pins the theme too, but this is belt and
+       braces since these testids are what actually render on screen. */
+    [data-testid="stSidebar"] * {
+        color: #1f1f1f !important;
+    }
+    [data-testid="stSidebar"] [data-testid="stCaptionContainer"] {
+        color: #5f6368 !important;
+    }
+
     [data-testid="stSidebar"] button {
-        text-align: left;
-        justify-content: flex-start;
+        text-align: left !important;
+        justify-content: flex-start !important;
         border: none !important;
         background: transparent !important;
         font-weight: 400;
@@ -114,10 +122,19 @@ st.markdown("""
         text-overflow: ellipsis;
         padding: 4px 10px !important;
         min-height: 2.1rem !important;
-        color: #1f1f1f !important;
+        width: 100%;
     }
-    [data-testid="stSidebar"] button p {
-        color: #1f1f1f !important;
+    /* Streamlit centers the text inside the button's inner <div>/<p> for
+       type="primary" buttons specifically — that's what was pulling the
+       currently-selected chat's title toward the middle even though the
+       outer button itself was already left-aligned. */
+    [data-testid="stSidebar"] button div,
+    [data-testid="stSidebar"] button p,
+    [data-testid="stSidebar"] button span {
+        text-align: left !important;
+        justify-content: flex-start !important;
+        width: 100%;
+        margin: 0 !important;
     }
     [data-testid="stSidebar"] button:hover {
         background-color: #e8eaed !important;
@@ -128,22 +145,38 @@ st.markdown("""
     [data-testid="stSidebar"] [data-testid="column"] {
         align-items: center;
     }
-    /* Best-effort hover-to-open for a collapsed sidebar. This is additive
-       only — it does NOT hide or replace Streamlit's native collapse
-       arrow, so if this selector ever stops matching in a future Streamlit
-       version, the manual arrow still works as a fallback. Relies on the
-       aria-expanded attribute Streamlit sets on the sidebar container. */
-    [data-testid="stSidebar"][aria-expanded="false"] {
-        transition: margin-left 220ms ease-in-out;
+
+    /* ---- Hover-to-expand sidebar rail (Gemini-style) ----
+       The sidebar stays "expanded" in Streamlit's own state at all times
+       (so its contents keep rendering) — we just visually collapse it to
+       a narrow rail with CSS and expand it back on :hover. This avoids
+       fighting Streamlit's internal open/close click handler, which is
+       not a public API and has changed data-testids across versions. */
+    [data-testid="collapsedControl"] { display: none !important; }
+
+    @media (min-width: 768px) {
+        [data-testid="stSidebar"] {
+            min-width: 72px !important;
+            max-width: 72px !important;
+            width: 72px !important;
+            transition: min-width 0.18s ease, max-width 0.18s ease, width 0.18s ease;
+            overflow-x: hidden;
+            z-index: 999;
+        }
+        [data-testid="stSidebar"]:hover {
+            min-width: 300px !important;
+            max-width: 300px !important;
+            width: 300px !important;
+        }
+        /* Keep row layouts (title + ⋮ menu columns) from squashing
+           while the rail is narrow. */
+        [data-testid="stSidebar"] [data-testid="stHorizontalBlock"] {
+            min-width: 260px;
+        }
     }
-    [data-testid="stSidebar"][aria-expanded="false"]:hover {
-        margin-left: 0 !important;
-    }
+
     #MainMenu {visibility: hidden;}
     footer {visibility: hidden;}
-    /* NOTE: header is intentionally NOT hidden — it contains Streamlit's
-       sidebar expand/collapse arrow. Hiding it makes the sidebar
-       impossible to reopen once collapsed, with no way back. */
     </style>
 """, unsafe_allow_html=True)
 
@@ -189,18 +222,18 @@ with st.sidebar:
     ]
     visible.sort(key=lambda item: (not item[1]["pinned"], -item[1]["created"]))
 
-    for cid, chat in visible:
+    for cid, chat_item in visible:
         is_current = (cid == st.session_state.current_chat_id)
 
         if st.session_state.rename_target == cid:
             new_title = st.text_input(
-                "Rename chat", value=chat["title"], key=f"rename_input_{cid}",
+                "Rename chat", value=chat_item["title"], key=f"rename_input_{cid}",
                 label_visibility="collapsed"
             )
             col_save, col_cancel = st.columns(2)
             with col_save:
                 if st.button("Save", key=f"rename_save_{cid}", use_container_width=True):
-                    chat["title"] = new_title.strip() or chat["title"]
+                    chat_item["title"] = new_title.strip() or chat_item["title"]
                     st.session_state.rename_target = None
                     st.rerun()
             with col_cancel:
@@ -211,7 +244,7 @@ with st.sidebar:
 
         col_title, col_menu = st.columns([5, 1])
         with col_title:
-            label = ("📌 " if chat["pinned"] else "") + chat["title"]
+            label = ("📌 " if chat_item["pinned"] else "") + chat_item["title"]
             if st.button(label, key=f"open_{cid}", use_container_width=True,
                          type="secondary" if not is_current else "primary"):
                 switch_to(cid)
@@ -230,12 +263,12 @@ with st.sidebar:
                     if st.button("🔗 Share conversation", key=f"share_{cid}"):
                         transcript = "\n\n".join(
                             f"{m['role'].capitalize()}: {m['content']}"
-                            for m in chat["messages"] if m.get("type", "text") == "text"
+                            for m in chat_item["messages"] if m.get("type", "text") == "text"
                         )
                         st.text_area("Copy this transcript:", value=transcript,
                                      height=150, key=f"share_text_{cid}")
-                    if st.button("📌 Unpin" if chat["pinned"] else "📌 Pin", key=f"pin_{cid}"):
-                        chat["pinned"] = not chat["pinned"]
+                    if st.button("📌 Unpin" if chat_item["pinned"] else "📌 Pin", key=f"pin_{cid}"):
+                        chat_item["pinned"] = not chat_item["pinned"]
                         st.rerun()
                     if st.button("✏️ Rename", key=f"rename_{cid}"):
                         st.session_state.rename_target = cid
@@ -248,18 +281,16 @@ with st.sidebar:
 # Main area
 # -------------------------------------------------------------------------
 chat = get_current_chat()
+chat.setdefault("context", "")
+chat.setdefault("uploaded_files", [])
 mode = chat["mode"]
 
 mode_label = {"chat": "💬 Chat", "image": "🖼️ Image generation", "video": "🎬 Video generation"}[mode]
 st.caption(mode_label)
 st.markdown(f"### {chat['title']}")
 
-
-def _render_attachment_preview(attachment: dict, width: int = 200) -> None:
-    if attachment["mime"].startswith("image/"):
-        st.image(attachment["bytes"], width=width)
-    else:
-        st.caption(f"📎 {attachment['name']}")
+if chat["uploaded_files"]:
+    st.caption("📎 Attached: " + ", ".join(chat["uploaded_files"]))
 
 
 def _maybe_set_title_from_prompt(prompt: str) -> None:
@@ -283,8 +314,6 @@ for message in chat["messages"]:
     msg_type = message.get("type", "text")
     with st.chat_message(message["role"]):
         if msg_type == "text":
-            if message.get("attachment"):
-                _render_attachment_preview(message["attachment"])
             st.markdown(message["content"])
         elif msg_type == "image":
             st.image(message["data"], caption=message.get("content"))
@@ -295,63 +324,77 @@ for message in chat["messages"]:
 
 # ---- input + generation, branched by mode ----
 if mode == "chat":
-    prompt_data = st.chat_input(
-        "Ask SparkAI", accept_file=True,
-        file_type=["png", "jpg", "jpeg", "webp", "pdf", "txt", "docx"],
+    # accept_file gives st.chat_input a real paperclip attach control,
+    # built into the same bar as the send arrow — this is what was
+    # missing before; there is no separate "+" control anymore.
+    submission = st.chat_input(
+        "Ask SparkAI or attach a PDF / text file / image",
+        accept_file="multiple",
+        file_type=["pdf", "txt", "md", "png", "jpg", "jpeg", "webp"],
     )
-    if prompt_data:
-        prompt = prompt_data.text or ""
-        files = prompt_data.files or []
-        attachment = None
-        if files:
-            f = files[0]
-            # mime type comes from the browser (f.type); Gemini accepts both
-            # image/* and application/pdf as document/vision parts the same way.
-            attachment = {"bytes": f.getvalue(), "mime": f.type or "application/octet-stream", "name": f.name}
 
-        if prompt or attachment:
-            _maybe_set_title_from_prompt(prompt or f"📎 {attachment['name']}")
+    if submission:
+        prompt = (submission.text or "").strip()
+        files = submission.files or []
 
-            user_msg = {"role": "user", "type": "text", "content": prompt}
-            if attachment:
-                user_msg["attachment"] = attachment
-            chat["messages"].append(user_msg)
+        doc_files = [f for f in files if not f.type.startswith("image/")]
+        image_files = [f for f in files if f.type.startswith("image/")]
 
-            with st.chat_message("user"):
-                if attachment:
-                    _render_attachment_preview(attachment)
-                if prompt:
-                    st.markdown(prompt)
-
-            text_history = [m for m in chat["messages"][:-1] if m.get("type", "text") == "text"]
-
-            extracted_context = ""
-            stream_kwargs = {}
-            if attachment:
-                if _is_native_binary(attachment):
-                    stream_kwargs = {"image_bytes": attachment["bytes"], "image_mime_type": attachment["mime"]}
-                    question = prompt or "Describe this file."
+        # Extract text from any attached documents and fold it into this
+        # chat's running context, same as before.
+        newly_attached, failed = [], []
+        for f in doc_files:
+            if f.name not in chat["uploaded_files"]:
+                text = extract_text_from_upload(f)
+                if text:
+                    chat["context"] = (chat["context"] + f"\n\n--- {f.name} ---\n{text}").strip()
+                    chat["uploaded_files"].append(f.name)
+                    newly_attached.append(f.name)
                 else:
-                    extracted_context = _extract_attachment_text(attachment)
-                    if not extracted_context:
-                        st.warning(f"Couldn't extract any text from {attachment['name']} — it may be empty, "
-                                   f"corrupted, or an unsupported internal format.")
-                    question = prompt or "Summarize this document."
-            else:
-                question = prompt
+                    failed.append(f.name)
 
-            with st.chat_message("assistant"):
-                response_container = st.empty()
-                full_response = ""
-                for chunk in ask_llm_stream(
-                    context=extracted_context, question=question,
-                    history=text_history, **stream_kwargs,
-                ):
-                    full_response += chunk
-                    response_container.markdown(full_response + "▌")
-                response_container.markdown(full_response)
+        # Images are NOT text-extracted — they're sent straight to the model
+        # as image data so it can actually see them (this only works on the
+        # Gemini path; Groq's chat model is text-only, see llm.py).
+        pending_images = []
+        for f in image_files:
+            pending_images.append((f.read(), f.type))
+            if f.name not in chat["uploaded_files"]:
+                chat["uploaded_files"].append(f.name)
+                newly_attached.append(f.name)
 
-            chat["messages"].append({"role": "assistant", "type": "text", "content": full_response})
+        if not prompt:
+            # File(s) with no question — give the model something to do.
+            prompt = "Summarize the attached file(s) and highlight anything important."
+
+        _maybe_set_title_from_prompt(prompt)
+        display_prompt = prompt
+        if newly_attached:
+            display_prompt += "\n\n📎 " + ", ".join(newly_attached)
+        chat["messages"].append({"role": "user", "type": "text", "content": display_prompt})
+        with st.chat_message("user"):
+            st.markdown(display_prompt)
+            for img_bytes, _mime in pending_images:
+                st.image(img_bytes)
+
+        if failed:
+            st.warning(f"Couldn't extract text from: {', '.join(failed)} "
+                       f"(likely a scanned/image-only PDF — OCR isn't wired up here).")
+
+        text_history = [m for m in chat["messages"][:-1] if m.get("type", "text") == "text"]
+
+        with st.chat_message("assistant"):
+            response_container = st.empty()
+            full_response = ""
+            for chunk in ask_llm_stream(
+                context=chat["context"], question=prompt,
+                history=text_history, images=pending_images or None,
+            ):
+                full_response += chunk
+                response_container.markdown(full_response + "▌")
+            response_container.markdown(full_response)
+
+        chat["messages"].append({"role": "assistant", "type": "text", "content": full_response})
 
 elif mode == "image":
     if prompt := st.chat_input("Describe the image you want to generate"):
