@@ -89,6 +89,10 @@ st.markdown("""
         text-overflow: ellipsis;
         padding: 4px 10px !important;
         min-height: 2.1rem !important;
+        color: #1f1f1f !important;
+    }
+    [data-testid="stSidebar"] button p {
+        color: #1f1f1f !important;
     }
     [data-testid="stSidebar"] button:hover {
         background-color: #e8eaed !important;
@@ -98,6 +102,17 @@ st.markdown("""
     }
     [data-testid="stSidebar"] [data-testid="column"] {
         align-items: center;
+    }
+    /* Best-effort hover-to-open for a collapsed sidebar. This is additive
+       only — it does NOT hide or replace Streamlit's native collapse
+       arrow, so if this selector ever stops matching in a future Streamlit
+       version, the manual arrow still works as a fallback. Relies on the
+       aria-expanded attribute Streamlit sets on the sidebar container. */
+    [data-testid="stSidebar"][aria-expanded="false"] {
+        transition: margin-left 220ms ease-in-out;
+    }
+    [data-testid="stSidebar"][aria-expanded="false"]:hover {
+        margin-left: 0 !important;
     }
     #MainMenu {visibility: hidden;}
     footer {visibility: hidden;}
@@ -236,6 +251,8 @@ for message in chat["messages"]:
     msg_type = message.get("type", "text")
     with st.chat_message(message["role"]):
         if msg_type == "text":
+            if message.get("attachment"):
+                st.image(message["attachment"]["bytes"], width=200)
             st.markdown(message["content"])
         elif msg_type == "image":
             st.image(message["data"], caption=message.get("content"))
@@ -244,37 +261,49 @@ for message in chat["messages"]:
         elif msg_type == "error":
             st.error(message["content"])
 
-# ---- "+" attachment menu (Gemini-style quick tool switcher) ----
-col_plus, col_spacer = st.columns([1, 11])
-with col_plus:
-    with st.popover("➕"):
-        st.caption("Create")
-        if st.button("🖼️ Images", key="plus_images", help="Create and edit", use_container_width=True):
-            new_chat("image")
-            st.rerun()
-        if st.button("🎬 Videos", key="plus_videos", help="Bring ideas to life", use_container_width=True):
-            new_chat("video")
-            st.rerun()
-
 # ---- input + generation, branched by mode ----
 if mode == "chat":
-    if prompt := st.chat_input("Ask SparkAI"):
-        _maybe_set_title_from_prompt(prompt)
-        chat["messages"].append({"role": "user", "type": "text", "content": prompt})
-        with st.chat_message("user"):
-            st.markdown(prompt)
+    prompt_data = st.chat_input(
+        "Ask SparkAI", accept_file=True, file_type=["png", "jpg", "jpeg", "webp"],
+    )
+    if prompt_data:
+        prompt = prompt_data.text or ""
+        files = prompt_data.files or []
+        attachment = None
+        if files:
+            f = files[0]
+            attachment = {"bytes": f.getvalue(), "mime": f.type or "image/png", "name": f.name}
 
-        text_history = [m for m in chat["messages"][:-1] if m.get("type", "text") == "text"]
+        if prompt or attachment:
+            _maybe_set_title_from_prompt(prompt or f"📎 {attachment['name']}")
 
-        with st.chat_message("assistant"):
-            response_container = st.empty()
-            full_response = ""
-            for chunk in ask_llm_stream(context="", question=prompt, history=text_history):
-                full_response += chunk
-                response_container.markdown(full_response + "▌")
-            response_container.markdown(full_response)
+            user_msg = {"role": "user", "type": "text", "content": prompt}
+            if attachment:
+                user_msg["attachment"] = attachment
+            chat["messages"].append(user_msg)
 
-        chat["messages"].append({"role": "assistant", "type": "text", "content": full_response})
+            with st.chat_message("user"):
+                if attachment:
+                    st.image(attachment["bytes"], width=200)
+                if prompt:
+                    st.markdown(prompt)
+
+            text_history = [m for m in chat["messages"][:-1] if m.get("type", "text") == "text"]
+            # If there's no text (image-only send), give the model something to act on.
+            question = prompt or "Describe this image."
+
+            with st.chat_message("assistant"):
+                response_container = st.empty()
+                full_response = ""
+                stream_kwargs = {}
+                if attachment:
+                    stream_kwargs = {"image_bytes": attachment["bytes"], "image_mime_type": attachment["mime"]}
+                for chunk in ask_llm_stream(context="", question=question, history=text_history, **stream_kwargs):
+                    full_response += chunk
+                    response_container.markdown(full_response + "▌")
+                response_container.markdown(full_response)
+
+            chat["messages"].append({"role": "assistant", "type": "text", "content": full_response})
 
 elif mode == "image":
     if prompt := st.chat_input("Describe the image you want to generate"):
