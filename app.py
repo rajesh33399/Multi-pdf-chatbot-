@@ -2,6 +2,7 @@
 app.py — SparkAI: Gemini-style layout with multi-chat sessions, image
 generation, and video generation.
 """
+import io
 import time
 import uuid
 
@@ -11,6 +12,30 @@ from llm import (
     ask_llm_stream, generate_image, generate_video,
     VideoGenerationUnavailable, ImageGenerationUnavailable,
 )
+
+# Native Gemini binary support: images + PDF. Everything else (.txt, .docx)
+# gets its text extracted locally and folded into the prompt as context —
+# Gemini's API does NOT natively parse raw .docx bytes the way it does PDFs.
+NATIVE_BINARY_MIME_PREFIXES = ("image/", "application/pdf")
+
+
+def _extract_attachment_text(attachment: dict) -> str:
+    """Extract plain text from a .txt or .docx attachment. Returns '' on failure."""
+    name_lower = attachment["name"].lower()
+    try:
+        if name_lower.endswith(".txt"):
+            return attachment["bytes"].decode("utf-8", errors="ignore")
+        if name_lower.endswith(".docx"):
+            import docx  # python-docx
+            document = docx.Document(io.BytesIO(attachment["bytes"]))
+            return "\n".join(p.text for p in document.paragraphs if p.text.strip())
+    except Exception:
+        pass
+    return ""
+
+
+def _is_native_binary(attachment: dict) -> bool:
+    return attachment["mime"].startswith(NATIVE_BINARY_MIME_PREFIXES)
 
 st.set_page_config(
     page_title="SparkAI",
@@ -230,6 +255,13 @@ st.caption(mode_label)
 st.markdown(f"### {chat['title']}")
 
 
+def _render_attachment_preview(attachment: dict, width: int = 200) -> None:
+    if attachment["mime"].startswith("image/"):
+        st.image(attachment["bytes"], width=width)
+    else:
+        st.caption(f"📎 {attachment['name']}")
+
+
 def _maybe_set_title_from_prompt(prompt: str) -> None:
     if chat["title"] == "New chat":
         chat["title"] = (prompt[:40] + "...") if len(prompt) > 40 else prompt
@@ -252,7 +284,7 @@ for message in chat["messages"]:
     with st.chat_message(message["role"]):
         if msg_type == "text":
             if message.get("attachment"):
-                st.image(message["attachment"]["bytes"], width=200)
+                _render_attachment_preview(message["attachment"])
             st.markdown(message["content"])
         elif msg_type == "image":
             st.image(message["data"], caption=message.get("content"))
@@ -264,7 +296,8 @@ for message in chat["messages"]:
 # ---- input + generation, branched by mode ----
 if mode == "chat":
     prompt_data = st.chat_input(
-        "Ask SparkAI", accept_file=True, file_type=["png", "jpg", "jpeg", "webp"],
+        "Ask SparkAI", accept_file=True,
+        file_type=["png", "jpg", "jpeg", "webp", "pdf", "txt", "docx"],
     )
     if prompt_data:
         prompt = prompt_data.text or ""
@@ -272,7 +305,9 @@ if mode == "chat":
         attachment = None
         if files:
             f = files[0]
-            attachment = {"bytes": f.getvalue(), "mime": f.type or "image/png", "name": f.name}
+            # mime type comes from the browser (f.type); Gemini accepts both
+            # image/* and application/pdf as document/vision parts the same way.
+            attachment = {"bytes": f.getvalue(), "mime": f.type or "application/octet-stream", "name": f.name}
 
         if prompt or attachment:
             _maybe_set_title_from_prompt(prompt or f"📎 {attachment['name']}")
@@ -284,21 +319,34 @@ if mode == "chat":
 
             with st.chat_message("user"):
                 if attachment:
-                    st.image(attachment["bytes"], width=200)
+                    _render_attachment_preview(attachment)
                 if prompt:
                     st.markdown(prompt)
 
             text_history = [m for m in chat["messages"][:-1] if m.get("type", "text") == "text"]
-            # If there's no text (image-only send), give the model something to act on.
-            question = prompt or "Describe this image."
+
+            extracted_context = ""
+            stream_kwargs = {}
+            if attachment:
+                if _is_native_binary(attachment):
+                    stream_kwargs = {"image_bytes": attachment["bytes"], "image_mime_type": attachment["mime"]}
+                    question = prompt or "Describe this file."
+                else:
+                    extracted_context = _extract_attachment_text(attachment)
+                    if not extracted_context:
+                        st.warning(f"Couldn't extract any text from {attachment['name']} — it may be empty, "
+                                   f"corrupted, or an unsupported internal format.")
+                    question = prompt or "Summarize this document."
+            else:
+                question = prompt
 
             with st.chat_message("assistant"):
                 response_container = st.empty()
                 full_response = ""
-                stream_kwargs = {}
-                if attachment:
-                    stream_kwargs = {"image_bytes": attachment["bytes"], "image_mime_type": attachment["mime"]}
-                for chunk in ask_llm_stream(context="", question=question, history=text_history, **stream_kwargs):
+                for chunk in ask_llm_stream(
+                    context=extracted_context, question=question,
+                    history=text_history, **stream_kwargs,
+                ):
                     full_response += chunk
                     response_container.markdown(full_response + "▌")
                 response_container.markdown(full_response)
