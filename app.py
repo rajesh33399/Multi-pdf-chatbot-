@@ -1,10 +1,11 @@
 """
 app.py — SparkAI: Gemini-style layout with multi-chat sessions, image
-generation, video generation, and document (PDF/TXT) upload for RAG.
+generation, video generation, and document (PDF/ZIP/TXT) upload for RAG.
 """
 import io
 import time
 import uuid
+import zipfile
 
 import streamlit as st
 from pypdf import PdfReader
@@ -66,21 +67,57 @@ def switch_to(chat_id: str) -> None:
     st.session_state.confirm_delete_id = None
 
 
-def extract_text_from_upload(uploaded_file) -> str:
-    """Best-effort text extraction. PDFs via pypdf, everything else as
-    plain text. Returns '' (never raises) so one bad file can't crash
-    the chat — the caller is responsible for telling the user if
-    extraction came back empty."""
-    name = uploaded_file.name.lower()
-    raw = uploaded_file.read()
+# -------------------------------------------------------------------------
+# File parsing helpers
+# -------------------------------------------------------------------------
+def _extract_pdf_text(raw: bytes) -> str:
+    reader = PdfReader(io.BytesIO(raw))
+    pages = [page.extract_text() or "" for page in reader.pages]
+    return "\n".join(pages).strip()
+
+
+def extract_text_from_bytes(name: str, raw: bytes) -> str:
+    """Best-effort text extraction from a filename + raw bytes. Returns ''
+    (never raises) so one bad file can't crash the chat — callers decide
+    how to surface a failure."""
+    lower = name.lower()
     try:
-        if name.endswith(".pdf"):
-            reader = PdfReader(io.BytesIO(raw))
-            pages = [page.extract_text() or "" for page in reader.pages]
-            return "\n".join(pages).strip()
-        return raw.decode("utf-8", errors="ignore").strip()
+        if lower.endswith(".pdf"):
+            return _extract_pdf_text(raw)
+        if lower.endswith((".txt", ".md")):
+            return raw.decode("utf-8", errors="ignore").strip()
+        return ""
     except Exception:
         return ""
+
+
+def extract_zip_contents(raw_zip: bytes) -> tuple[list[tuple[str, str]], list[str]]:
+    """Unzip in memory and extract text from every .pdf/.txt/.md entry inside.
+    Returns (successes, failures) where successes is a list of
+    (entry_name, text) and failures is a list of entry names that produced
+    no text (corrupt, scanned-image PDF, unsupported type, etc.)."""
+    successes, failures = [], []
+    try:
+        with zipfile.ZipFile(io.BytesIO(raw_zip)) as zf:
+            for info in zf.infolist():
+                if info.is_dir():
+                    continue
+                name = info.filename
+                if not name.lower().endswith((".pdf", ".txt", ".md")):
+                    continue
+                try:
+                    raw = zf.read(name)
+                except Exception:
+                    failures.append(name)
+                    continue
+                text = extract_text_from_bytes(name, raw)
+                if text:
+                    successes.append((name, text))
+                else:
+                    failures.append(name)
+    except zipfile.BadZipFile:
+        failures.append("(unreadable/corrupt zip archive)")
+    return successes, failures
 
 
 # Bootstrap the very first chat on cold start
@@ -100,17 +137,12 @@ st.markdown("""
         border-right: 1px solid #e0e0e0;
         padding-top: 10px;
     }
-
-    /* Force readable text regardless of the visitor's light/dark browser
-       preference. config.toml pins the theme too, but this is belt and
-       braces since these testids are what actually render on screen. */
     [data-testid="stSidebar"] * {
         color: #1f1f1f !important;
     }
     [data-testid="stSidebar"] [data-testid="stCaptionContainer"] {
         color: #5f6368 !important;
     }
-
     [data-testid="stSidebar"] button {
         text-align: left !important;
         justify-content: flex-start !important;
@@ -124,10 +156,6 @@ st.markdown("""
         min-height: 2.1rem !important;
         width: 100%;
     }
-    /* Streamlit centers the text inside the button's inner <div>/<p> for
-       type="primary" buttons specifically — that's what was pulling the
-       currently-selected chat's title toward the middle even though the
-       outer button itself was already left-aligned. */
     [data-testid="stSidebar"] button div,
     [data-testid="stSidebar"] button p,
     [data-testid="stSidebar"] button span {
@@ -146,14 +174,8 @@ st.markdown("""
         align-items: center;
     }
 
-    /* ---- Hover-to-expand sidebar rail (Gemini-style) ----
-       The sidebar stays "expanded" in Streamlit's own state at all times
-       (so its contents keep rendering) — we just visually collapse it to
-       a narrow rail with CSS and expand it back on :hover. This avoids
-       fighting Streamlit's internal open/close click handler, which is
-       not a public API and has changed data-testids across versions. */
+    /* ---- Hover-to-expand sidebar rail (Gemini-style) ---- */
     [data-testid="collapsedControl"] { display: none !important; }
-
     @media (min-width: 768px) {
         [data-testid="stSidebar"] {
             min-width: 72px !important;
@@ -168,40 +190,30 @@ st.markdown("""
             max-width: 300px !important;
             width: 300px !important;
         }
-        /* Keep row layouts (title + ⋮ menu columns) from squashing
-           while the rail is narrow. */
         [data-testid="stSidebar"] [data-testid="stHorizontalBlock"] {
             min-width: 260px;
         }
     }
 
-    /* =====================================================================
-       GEMINI-STYLE CHAT BUBBLES
-       We keep st.chat_message as the mechanism (so st.image/st.video/
-       st.spinner keep working natively inside a message) and reskin it
-       with CSS instead of hand-rolling HTML for every message: hide the
-       colored avatar squares, right-align + pill-bubble the user's turn,
-       left-align the assistant's turn with a small sparkle instead of an
-       avatar block. These selectors (data-testid + the "Chat message
-       from X" aria-label) come from Streamlit's actual shipped frontend.
-       ===================================================================== */
-
-    /* Hide the default colored avatar blocks entirely */
+    /* ---- Gemini-style chat bubbles ----
+       We keep st.chat_message as the mechanism (so st.image/st.video keep
+       working natively inside a message) and reskin it with CSS instead of
+       hand-rolling HTML for every message: hide the colored avatar squares,
+       right-align + pill-bubble the user's turn, left-align the assistant's
+       turn with a small sparkle instead of an avatar block. These selectors
+       (data-testid + the "Chat message from X" aria-label) come from
+       Streamlit 1.60's actual shipped frontend, not guessed. */
     [data-testid="stChatMessageAvatarUser"],
     [data-testid="stChatMessageAvatarAssistant"],
     [data-testid="stChatMessageAvatarCustom"] {
         display: none !important;
     }
-
-    /* Strip the default message container chrome (border/background/gap) */
     [data-testid="stChatMessage"] {
         background: transparent !important;
         border: none !important;
-        padding: 6px 0 !important;
+        padding: 2px 0 !important;
         gap: 0 !important;
     }
-
-    /* ---- USER MESSAGE: right-aligned light-grey pill ---- */
     [data-testid="stChatMessage"][aria-label="Chat message from user"] {
         justify-content: flex-end !important;
     }
@@ -211,27 +223,15 @@ st.markdown("""
         padding: 10px 18px !important;
         max-width: 70%;
         margin-left: auto;
-        font-size: 15px;
-        line-height: 1.5;
     }
-    /* Images the user attaches inside their own bubble shouldn't blow past it */
-    [data-testid="stChatMessage"][aria-label="Chat message from user"] img {
-        border-radius: 12px;
-        margin-top: 8px;
-        max-width: 100%;
-    }
-
-    /* ---- ASSISTANT MESSAGE: left-aligned, sparkle instead of avatar ---- */
     [data-testid="stChatMessage"][aria-label="Chat message from assistant"] {
         justify-content: flex-start !important;
     }
     [data-testid="stChatMessage"][aria-label="Chat message from assistant"] [data-testid="stChatMessageContent"] {
         background: transparent;
-        padding: 4px 0 4px 28px !important;
+        padding: 4px 0 4px 26px !important;
         max-width: 85%;
         position: relative;
-        font-size: 15.5px;
-        line-height: 1.6;
     }
     [data-testid="stChatMessage"][aria-label="Chat message from assistant"] [data-testid="stChatMessageContent"]::before {
         content: "✨";
@@ -240,25 +240,10 @@ st.markdown("""
         top: 2px;
         font-size: 13px;
     }
-    /* Keep markdown paragraphs/lists tidy under the sparkle, not double-indented */
-    [data-testid="stChatMessage"][aria-label="Chat message from assistant"] [data-testid="stChatMessageContent"] p {
-        margin: 0 0 10px 0;
-    }
-    [data-testid="stChatMessage"][aria-label="Chat message from assistant"] [data-testid="stChatMessageContent"] ol,
-    [data-testid="stChatMessage"][aria-label="Chat message from assistant"] [data-testid="stChatMessageContent"] ul {
-        margin: 4px 0 10px 20px;
-        padding-left: 0;
-    }
-    [data-testid="stChatMessage"][aria-label="Chat message from assistant"] img,
-    [data-testid="stChatMessage"][aria-label="Chat message from assistant"] video {
-        border-radius: 12px;
-        margin-top: 8px;
-        max-width: 100%;
-    }
 
     /* ---- Reskin the chat_input's built-in attach control to a plain
        "+" instead of the default paperclip, to match Gemini. This targets
-       Streamlit's stChatInputFileUploadButton testid; if a future
+       Streamlit's real stChatInputFileUploadButton testid; if a future
        Streamlit version renames it, this rule just silently no-ops and
        you get the default paperclip icon back, not a broken layout. ---- */
     [data-testid="stChatInputFileUploadButton"] svg {
@@ -308,10 +293,6 @@ with st.sidebar:
     st.markdown("---")
     st.caption("Recent")
 
-    # Build the visible list: filter by search query if active, pinned
-    # chats first, then most-recent first. Only show chats that have at
-    # least one message — an untouched fresh "New chat" doesn't clutter
-    # Recents, matching how Gemini itself behaves.
     query = (st.session_state.get("search_query") or "").strip().lower()
     visible = [
         (cid, c) for cid, c in st.session_state.chats.items()
@@ -421,13 +402,10 @@ for message in chat["messages"]:
 
 # ---- input + generation, branched by mode ----
 if mode == "chat":
-    # accept_file gives st.chat_input a real paperclip attach control,
-    # built into the same bar as the send arrow — this is what was
-    # missing before; there is no separate "+" control anymore.
     submission = st.chat_input(
-        "Ask SparkAI or attach a PDF / text file / image",
+        "Ask SparkAI",
         accept_file="multiple",
-        file_type=["pdf", "txt", "md", "png", "jpg", "jpeg", "webp"],
+        file_type=["pdf", "txt", "md", "zip", "png", "jpg", "jpeg", "webp"],
     )
 
     if submission:
@@ -437,12 +415,24 @@ if mode == "chat":
         doc_files = [f for f in files if not f.type.startswith("image/")]
         image_files = [f for f in files if f.type.startswith("image/")]
 
-        # Extract text from any attached documents and fold it into this
-        # chat's running context, same as before.
         newly_attached, failed = [], []
+
         for f in doc_files:
-            if f.name not in chat["uploaded_files"]:
-                text = extract_text_from_upload(f)
+            if f.name in chat["uploaded_files"]:
+                continue
+            raw = f.read()
+            if f.name.lower().endswith(".zip"):
+                successes, zip_failures = extract_zip_contents(raw)
+                chat["uploaded_files"].append(f.name)
+                for entry_name, text in successes:
+                    label = f"{f.name}/{entry_name}"
+                    chat["context"] = (chat["context"] + f"\n\n--- {label} ---\n{text}").strip()
+                    newly_attached.append(label)
+                failed.extend(f"{f.name}/{n}" for n in zip_failures)
+                if not successes and not zip_failures:
+                    failed.append(f"{f.name} (no .pdf/.txt/.md files found inside)")
+            else:
+                text = extract_text_from_bytes(f.name, raw)
                 if text:
                     chat["context"] = (chat["context"] + f"\n\n--- {f.name} ---\n{text}").strip()
                     chat["uploaded_files"].append(f.name)
@@ -450,9 +440,9 @@ if mode == "chat":
                 else:
                     failed.append(f.name)
 
-        # Images are NOT text-extracted — they're sent straight to the model
-        # as image data so it can actually see them (this only works on the
-        # Gemini path; Groq's chat model is text-only, see llm.py).
+        # Images go straight to the model as image data (not text-extracted).
+        # This only actually reaches the model on the Gemini path — see
+        # llm.py's ask_llm_stream, since Groq's chat model is text-only.
         pending_images = []
         for f in image_files:
             pending_images.append((f.read(), f.type))
@@ -461,7 +451,6 @@ if mode == "chat":
                 newly_attached.append(f.name)
 
         if not prompt:
-            # File(s) with no question — give the model something to do.
             prompt = "Summarize the attached file(s) and highlight anything important."
 
         _maybe_set_title_from_prompt(prompt)
@@ -476,7 +465,8 @@ if mode == "chat":
 
         if failed:
             st.warning(f"Couldn't extract text from: {', '.join(failed)} "
-                       f"(likely a scanned/image-only PDF — OCR isn't wired up here).")
+                       f"(likely a scanned/image-only PDF, an unsupported file type inside "
+                       f"the zip, or a corrupt archive — OCR isn't wired up here).")
 
         text_history = [m for m in chat["messages"][:-1] if m.get("type", "text") == "text"]
 
