@@ -2,11 +2,13 @@
 app.py — SparkAI: Gemini-style layout with multi-chat sessions, image
 generation, video generation, and document (PDF/ZIP/TXT) upload for RAG.
 """
+import html
 import io
 import time
 import uuid
 import zipfile
 
+import markdown as md_lib
 import streamlit as st
 from pypdf import PdfReader
 
@@ -65,6 +67,42 @@ def switch_to(chat_id: str) -> None:
     st.session_state.current_chat_id = chat_id
     st.session_state.rename_target = None
     st.session_state.confirm_delete_id = None
+
+
+def _build_bubble_html(role: str, content: str) -> str:
+    body_html = md_lib.markdown(html.escape(content), extensions=["sane_lists"])
+    if role == "user":
+        return f'<div class="sparkai-msg sparkai-user"><div class="sparkai-bubble">{body_html}</div></div>'
+    return (
+        f'<div class="sparkai-msg sparkai-assistant">'
+        f'<span class="sparkai-sparkle">✨</span>'
+        f'<div class="sparkai-bubble">{body_html}</div></div>'
+    )
+
+
+def render_message_bubble(role: str, content: str) -> None:
+    """Render one text message as a self-authored HTML bubble — right-aligned
+    grey pill for the user, left-aligned plain text with a sparkle for the
+    assistant. Content is HTML-escaped first (so a stray '<script>' typed by
+    the user, or echoed back from an uploaded document, can't execute), then
+    run through Markdown so bold/lists/links from the LLM still render."""
+    st.markdown(_build_bubble_html(role, content), unsafe_allow_html=True)
+
+
+def open_assistant_media_row() -> None:
+    """Left-aligned sparkle row for wrapping st.image/st.video, which can't
+    be embedded inside a markdown string. Streamlit renders each call as a
+    sibling element in DOM order, so the widget in between lands inside
+    this still-open div; close_assistant_media_row() closes it afterward."""
+    st.markdown(
+        '<div class="sparkai-msg sparkai-assistant">'
+        '<span class="sparkai-sparkle">✨</span><div class="sparkai-bubble">',
+        unsafe_allow_html=True,
+    )
+
+
+def close_assistant_media_row() -> None:
+    st.markdown('</div></div>', unsafe_allow_html=True)
 
 
 # -------------------------------------------------------------------------
@@ -173,6 +211,15 @@ st.markdown("""
     [data-testid="stSidebar"] [data-testid="column"] {
         align-items: center;
     }
+    /* Non-button sidebar text (the "SparkAI" heading, "Recent" caption)
+       was wrapping letter-by-letter down the 72px collapsed rail — buttons
+       had white-space:nowrap already, these didn't. */
+    [data-testid="stSidebar"] h2,
+    [data-testid="stSidebar"] [data-testid="stCaptionContainer"] {
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+    }
 
     /* ---- Hover-to-expand sidebar rail (Gemini-style) ---- */
     [data-testid="collapsedControl"] { display: none !important; }
@@ -196,50 +243,45 @@ st.markdown("""
     }
 
     /* ---- Gemini-style chat bubbles ----
-       We keep st.chat_message as the mechanism (so st.image/st.video keep
-       working natively inside a message) and reskin it with CSS instead of
-       hand-rolling HTML for every message: hide the colored avatar squares,
-       right-align + pill-bubble the user's turn, left-align the assistant's
-       turn with a small sparkle instead of an avatar block. These selectors
-       (data-testid + the "Chat message from X" aria-label) come from
-       Streamlit 1.60's actual shipped frontend, not guessed. */
-    [data-testid="stChatMessageAvatarUser"],
-    [data-testid="stChatMessageAvatarAssistant"],
-    [data-testid="stChatMessageAvatarCustom"] {
-        display: none !important;
+       Self-authored markup (see render_message_bubble in app.py), not a
+       reskin of Streamlit's internal chat_message DOM. The previous CSS
+       reskin approach targeted real testids/aria-labels confirmed to exist
+       in Streamlit's shipped frontend, but it still lost to Streamlit's
+       own runtime style injection in production — rather than keep
+       guessing at specificity/load-order blind, these classes are ours
+       end to end, so what you see here is exactly what ships. */
+    .sparkai-msg {
+        display: flex;
+        width: 100%;
+        margin: 6px 0;
     }
-    [data-testid="stChatMessage"] {
-        background: transparent !important;
-        border: none !important;
-        padding: 2px 0 !important;
-        gap: 0 !important;
+    .sparkai-msg.sparkai-user {
+        justify-content: flex-end;
     }
-    [data-testid="stChatMessage"][aria-label="Chat message from user"] {
-        justify-content: flex-end !important;
-    }
-    [data-testid="stChatMessage"][aria-label="Chat message from user"] [data-testid="stChatMessageContent"] {
+    .sparkai-msg.sparkai-user .sparkai-bubble {
         background-color: #f0f1f3;
         border-radius: 20px;
-        padding: 10px 18px !important;
+        padding: 10px 18px;
         max-width: 70%;
-        margin-left: auto;
+        color: #1f1f1f;
     }
-    [data-testid="stChatMessage"][aria-label="Chat message from assistant"] {
-        justify-content: flex-start !important;
+    .sparkai-msg.sparkai-assistant {
+        justify-content: flex-start;
+        align-items: flex-start;
+        gap: 8px;
     }
-    [data-testid="stChatMessage"][aria-label="Chat message from assistant"] [data-testid="stChatMessageContent"] {
-        background: transparent;
-        padding: 4px 0 4px 26px !important;
-        max-width: 85%;
-        position: relative;
-    }
-    [data-testid="stChatMessage"][aria-label="Chat message from assistant"] [data-testid="stChatMessageContent"]::before {
-        content: "✨";
-        position: absolute;
-        left: 0;
-        top: 2px;
+    .sparkai-msg.sparkai-assistant .sparkai-sparkle {
         font-size: 13px;
+        line-height: 1.8;
+        flex-shrink: 0;
     }
+    .sparkai-msg.sparkai-assistant .sparkai-bubble {
+        max-width: 85%;
+        color: #1f1f1f;
+    }
+    .sparkai-bubble p:first-child { margin-top: 0; }
+    .sparkai-bubble p:last-child { margin-bottom: 0; }
+    .sparkai-bubble ol, .sparkai-bubble ul { margin: 6px 0; padding-left: 22px; }
 
     /* ---- Reskin the chat_input's built-in attach control to a plain
        "+" instead of the default paperclip, to match Gemini. This targets
@@ -390,15 +432,18 @@ if not chat["messages"]:
 # ---- render existing messages ----
 for message in chat["messages"]:
     msg_type = message.get("type", "text")
-    with st.chat_message(message["role"]):
-        if msg_type == "text":
-            st.markdown(message["content"])
-        elif msg_type == "image":
-            st.image(message["data"], caption=message.get("content"))
-        elif msg_type == "video":
-            st.video(message["data"])
-        elif msg_type == "error":
-            st.error(message["content"])
+    if msg_type == "text":
+        render_message_bubble(message["role"], message["content"])
+    elif msg_type == "image":
+        open_assistant_media_row()
+        st.image(message["data"], caption=message.get("content"))
+        close_assistant_media_row()
+    elif msg_type == "video":
+        open_assistant_media_row()
+        st.video(message["data"])
+        close_assistant_media_row()
+    elif msg_type == "error":
+        st.error(message["content"])
 
 # ---- input + generation, branched by mode ----
 if mode == "chat":
@@ -458,10 +503,9 @@ if mode == "chat":
         if newly_attached:
             display_prompt += "\n\n📎 " + ", ".join(newly_attached)
         chat["messages"].append({"role": "user", "type": "text", "content": display_prompt})
-        with st.chat_message("user"):
-            st.markdown(display_prompt)
-            for img_bytes, _mime in pending_images:
-                st.image(img_bytes)
+        render_message_bubble("user", display_prompt)
+        for img_bytes, _mime in pending_images:
+            st.image(img_bytes, width=220)
 
         if failed:
             st.warning(f"Couldn't extract text from: {', '.join(failed)} "
@@ -470,16 +514,15 @@ if mode == "chat":
 
         text_history = [m for m in chat["messages"][:-1] if m.get("type", "text") == "text"]
 
-        with st.chat_message("assistant"):
-            response_container = st.empty()
-            full_response = ""
-            for chunk in ask_llm_stream(
-                context=chat["context"], question=prompt,
-                history=text_history, images=pending_images or None,
-            ):
-                full_response += chunk
-                response_container.markdown(full_response + "▌")
-            response_container.markdown(full_response)
+        response_container = st.empty()
+        full_response = ""
+        for chunk in ask_llm_stream(
+            context=chat["context"], question=prompt,
+            history=text_history, images=pending_images or None,
+        ):
+            full_response += chunk
+            response_container.markdown(_build_bubble_html("assistant", full_response + "▌"), unsafe_allow_html=True)
+        response_container.markdown(_build_bubble_html("assistant", full_response), unsafe_allow_html=True)
 
         chat["messages"].append({"role": "assistant", "type": "text", "content": full_response})
 
@@ -487,50 +530,50 @@ elif mode == "image":
     if prompt := st.chat_input("Describe the image you want to generate"):
         _maybe_set_title_from_prompt(prompt)
         chat["messages"].append({"role": "user", "type": "text", "content": prompt})
-        with st.chat_message("user"):
-            st.markdown(prompt)
+        render_message_bubble("user", prompt)
 
-        with st.chat_message("assistant"):
-            with st.spinner("🎨 Generating image..."):
-                try:
-                    image_bytes = generate_image(prompt)
-                    st.image(image_bytes, caption=prompt)
-                    chat["messages"].append({
-                        "role": "assistant", "type": "image",
-                        "data": image_bytes, "content": prompt,
-                    })
-                except ImageGenerationUnavailable as e:
-                    st.error(str(e))
-                    chat["messages"].append({"role": "assistant", "type": "error", "content": str(e)})
-                except Exception as e:
-                    st.error(f"Couldn't generate that image: {e}")
-                    chat["messages"].append({
-                        "role": "assistant", "type": "error",
-                        "content": f"Couldn't generate that image: {e}",
-                    })
+        with st.spinner("🎨 Generating image..."):
+            try:
+                image_bytes = generate_image(prompt)
+                open_assistant_media_row()
+                st.image(image_bytes, caption=prompt)
+                close_assistant_media_row()
+                chat["messages"].append({
+                    "role": "assistant", "type": "image",
+                    "data": image_bytes, "content": prompt,
+                })
+            except ImageGenerationUnavailable as e:
+                st.error(str(e))
+                chat["messages"].append({"role": "assistant", "type": "error", "content": str(e)})
+            except Exception as e:
+                st.error(f"Couldn't generate that image: {e}")
+                chat["messages"].append({
+                    "role": "assistant", "type": "error",
+                    "content": f"Couldn't generate that image: {e}",
+                })
 
 elif mode == "video":
     if prompt := st.chat_input("Describe the video you want to generate"):
         _maybe_set_title_from_prompt(prompt)
         chat["messages"].append({"role": "user", "type": "text", "content": prompt})
-        with st.chat_message("user"):
-            st.markdown(prompt)
+        render_message_bubble("user", prompt)
 
-        with st.chat_message("assistant"):
-            with st.spinner("🎬 Generating video — this can take a few minutes..."):
-                try:
-                    video_bytes = generate_video(prompt)
-                    st.video(video_bytes)
-                    chat["messages"].append({
-                        "role": "assistant", "type": "video",
-                        "data": video_bytes, "content": prompt,
-                    })
-                except VideoGenerationUnavailable as e:
-                    st.error(str(e))
-                    chat["messages"].append({"role": "assistant", "type": "error", "content": str(e)})
-                except Exception as e:
-                    st.error(f"Couldn't generate that video: {e}")
-                    chat["messages"].append({
-                        "role": "assistant", "type": "error",
-                        "content": f"Couldn't generate that video: {e}",
-                    })
+        with st.spinner("🎬 Generating video — this can take a few minutes..."):
+            try:
+                video_bytes = generate_video(prompt)
+                open_assistant_media_row()
+                st.video(video_bytes)
+                close_assistant_media_row()
+                chat["messages"].append({
+                    "role": "assistant", "type": "video",
+                    "data": video_bytes, "content": prompt,
+                })
+            except VideoGenerationUnavailable as e:
+                st.error(str(e))
+                chat["messages"].append({"role": "assistant", "type": "error", "content": str(e)})
+            except Exception as e:
+                st.error(f"Couldn't generate that video: {e}")
+                chat["messages"].append({
+                    "role": "assistant", "type": "error",
+                    "content": f"Couldn't generate that video: {e}",
+                })
