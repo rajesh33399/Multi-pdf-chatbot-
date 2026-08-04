@@ -212,34 +212,12 @@ st.markdown("""
         align-items: center;
     }
     /* Non-button sidebar text (the "SparkAI" heading, "Recent" caption)
-       was wrapping letter-by-letter down the 72px collapsed rail — buttons
-       had white-space:nowrap already, these didn't. */
+       stays on one line and truncates instead of wrapping. */
     [data-testid="stSidebar"] h2,
     [data-testid="stSidebar"] [data-testid="stCaptionContainer"] {
         white-space: nowrap;
         overflow: hidden;
         text-overflow: ellipsis;
-    }
-
-    /* ---- Hover-to-expand sidebar rail (Gemini-style) ---- */
-    [data-testid="collapsedControl"] { display: none !important; }
-    @media (min-width: 768px) {
-        [data-testid="stSidebar"] {
-            min-width: 72px !important;
-            max-width: 72px !important;
-            width: 72px !important;
-            transition: min-width 0.18s ease, max-width 0.18s ease, width 0.18s ease;
-            overflow-x: hidden;
-            z-index: 999;
-        }
-        [data-testid="stSidebar"]:hover {
-            min-width: 300px !important;
-            max-width: 300px !important;
-            width: 300px !important;
-        }
-        [data-testid="stSidebar"] [data-testid="stHorizontalBlock"] {
-            min-width: 260px;
-        }
     }
 
     /* ---- Gemini-style chat bubbles ----
