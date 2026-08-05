@@ -110,7 +110,7 @@ def close_assistant_media_row() -> None:
 # -------------------------------------------------------------------------
 def _extract_pdf_text(raw: bytes) -> str:
     reader = PdfReader(io.BytesIO(raw))
-    pages = [page.extract_text() or "" for page in reader.pages]
+    pages = [page.extract_text(extraction_mode="layout") or "" for page in reader.pages]
     return "\n".join(pages).strip()
 
 
