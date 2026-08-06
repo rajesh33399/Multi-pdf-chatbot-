@@ -4,3 +4,12 @@ primaryColor = "#1a73e8"
 backgroundColor = "#ffffff"
 secondaryBackgroundColor = "#f8f9fa"
 textColor = "#1f1f1f"
+
+[server]
+# Explicit upload cap (MB) so large PDFs (e.g. multi-page scanned notes)
+# aren't silently rejected client-side, which shows up as a red error
+# badge on the staged file instead of an actual error message.
+maxUploadSize = 500
+
+[browser]
+gatherUsageStats = false
