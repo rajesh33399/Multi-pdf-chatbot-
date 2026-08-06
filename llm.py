@@ -28,8 +28,10 @@ import logging
 import os
 import random
 import time
+import urllib.parse
 from typing import Iterator, Optional
 
+import requests
 import streamlit as st
 from huggingface_hub import InferenceClient
 from huggingface_hub.errors import HfHubHTTPError
@@ -47,18 +49,25 @@ AI_PROVIDER = os.environ.get("AI_PROVIDER", "groq")
 GROQ_MODEL = os.environ.get("GROQ_MODEL", "llama-3.1-8b-instant")
 GEMINI_TEXT_MODEL = os.environ.get("GEMINI_TEXT_MODEL", "gemini-3.6-flash")
 
-# Hugging Face Inference Providers — model IDs. As of mid-2025, HF's old
-# legacy REST endpoint (api-inference.huggingface.co/models/<id>) mostly
-# only serves small CPU models; GPU diffusion/video models are only
-# reachable through Inference Providers routing (huggingface_hub's
-# InferenceClient), which picks a real backend (fal-ai, Together,
-# Replicate, etc.) to actually run the model. Override via env vars.
-HF_IMAGE_MODEL = os.environ.get("HF_IMAGE_MODEL", "black-forest-labs/FLUX.1-schnell")
+# Pollinations — free, no-API-key text-to-image endpoint. Used for
+# generate_image() instead of Hugging Face, since HF's free serverless
+# routing for GPU diffusion models (FLUX etc.) has proven unreliable across
+# all provider/token combinations. No account, no key, no rotation needed.
+POLLINATIONS_IMAGE_URL = os.environ.get(
+    "POLLINATIONS_IMAGE_URL", "https://image.pollinations.ai/prompt"
+)
+POLLINATIONS_TIMEOUT = int(os.environ.get("POLLINATIONS_TIMEOUT", "60"))
+
+# Hugging Face Inference Providers — model ID for video. As of mid-2025,
+# HF's old legacy REST endpoint (api-inference.huggingface.co/models/<id>)
+# mostly only serves small CPU models; GPU video models are only reachable
+# through Inference Providers routing (huggingface_hub's InferenceClient),
+# which picks a real backend (fal-ai, Together, Replicate, etc.) to
+# actually run the model. Override via env var if needed.
 HF_VIDEO_MODEL = os.environ.get("HF_VIDEO_MODEL", "Wan-AI/Wan2.2-T2V-A14B")
 # Provider to route through. "auto" lets HF pick the fastest available
-# provider that serves the model; you can pin one (e.g. "fal-ai",
-# "together", "replicate") if you want consistent behavior/pricing.
-HF_IMAGE_PROVIDER = os.environ.get("HF_IMAGE_PROVIDER", "auto")
+# provider that serves the model; you can pin one (e.g. "fal-ai") if you
+# want consistent behavior/pricing.
 HF_VIDEO_PROVIDER = os.environ.get("HF_VIDEO_PROVIDER", "auto")
 
 # How long (seconds) to let a token "cool down" after it gets rate-limited
@@ -336,29 +345,30 @@ def ask_llm(context: str, question: str, history: Optional[list[dict]] = None) -
 # Image generation — Hugging Face Inference API, rotating across tokens.
 # ----------------------------------------------------
 def generate_image(prompt: str) -> bytes:
-    """Generate an image from a text prompt via Hugging Face Inference
-    Providers. Returns raw PNG bytes. Rotates across every token in
-    HF_API_KEYS, skipping any token that's currently cooling down from a
-    recent 429.
+    """Generate an image from a text prompt via Pollinations — a free,
+    no-API-key image generation endpoint. Returns raw image bytes (JPEG).
 
-    Raises ImageGenerationUnavailable if every configured token is
-    rate-limited/unauthorized, or no provider currently serves the model.
+    Raises ImageGenerationUnavailable if the request fails (network issue,
+    Pollinations having an outage, etc.) — this is rare since there's no
+    per-account rate limit or auth to manage here.
     """
-    def _call(client: InferenceClient):
-        image = client.text_to_image(prompt, model=HF_IMAGE_MODEL)
-        buf = io.BytesIO()
-        image.save(buf, format="PNG")
-        return buf.getvalue()
-
+    encoded_prompt = urllib.parse.quote(prompt, safe="")
+    url = f"{POLLINATIONS_IMAGE_URL}/{encoded_prompt}"
     try:
-        return _hf_call_with_rotation(_call, model=HF_IMAGE_MODEL, provider=HF_IMAGE_PROVIDER)
-    except RuntimeError as e:
-        logger.exception("Image generation failed on every HF token")
+        resp = requests.get(
+            url,
+            params={"nologo": "true"},
+            timeout=POLLINATIONS_TIMEOUT,
+        )
+        resp.raise_for_status()
+        if not resp.content:
+            raise RuntimeError("Pollinations returned an empty response body.")
+        return resp.content
+    except requests.RequestException as e:
+        logger.exception("Pollinations image generation failed")
         raise ImageGenerationUnavailable(
-            "Image generation is temporarily unavailable — see the app logs "
-            "for the real error from Hugging Face (invalid token, no "
-            "provider serving this model, or genuine rate limiting). "
-            "Please try again in a minute."
+            "Image generation is temporarily unavailable — Pollinations "
+            "didn't respond correctly. Please try again in a moment."
         ) from e
 
 
