@@ -8,8 +8,11 @@ import time
 import uuid
 import zipfile
 
+import fitz  # pymupdf — renders PDF pages to images for OCR fallback
 import markdown as md_lib
+import pytesseract
 import streamlit as st
+from PIL import Image
 from pypdf import PdfReader
 
 from llm import (
@@ -108,10 +111,48 @@ def close_assistant_media_row() -> None:
 # -------------------------------------------------------------------------
 # File parsing helpers
 # -------------------------------------------------------------------------
+
+# How short (in characters) the pypdf text-layer result has to be, across
+# the WHOLE document, before we bother firing up OCR. Keeps normal
+# text-based PDFs fast (no OCR needed) while still catching scanned /
+# handwritten / image-only PDFs that have no real text layer at all.
+OCR_FALLBACK_THRESHOLD = 20
+
+# OCR render quality: 2x zoom ≈ 144 DPI, a good balance of accuracy vs
+# speed. Bump to 3 if handwriting/small text is still coming out garbled.
+OCR_ZOOM = 2
+
+
+def _ocr_pdf(raw: bytes) -> str:
+    """Render every page of a PDF to an image and run Tesseract OCR on it.
+    Used when the PDF has no real text layer (scanned pages, handwritten
+    notes exported as images, etc.) so pypdf alone would return nothing."""
+    text_parts = []
+    doc = fitz.open(stream=raw, filetype="pdf")
+    try:
+        for page in doc:
+            pix = page.get_pixmap(matrix=fitz.Matrix(OCR_ZOOM, OCR_ZOOM))
+            img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
+            page_text = pytesseract.image_to_string(img)
+            if page_text.strip():
+                text_parts.append(page_text.strip())
+    finally:
+        doc.close()
+    return "\n".join(text_parts).strip()
+
+
 def _extract_pdf_text(raw: bytes) -> str:
     reader = PdfReader(io.BytesIO(raw))
     pages = [page.extract_text(extraction_mode="layout") or "" for page in reader.pages]
-    return "\n".join(pages).strip()
+    text = "\n".join(pages).strip()
+
+    # No usable text layer (scanned / handwritten / image-only PDF) -> OCR.
+    if len(text) < OCR_FALLBACK_THRESHOLD:
+        ocr_text = _ocr_pdf(raw)
+        if ocr_text:
+            return ocr_text
+
+    return text
 
 
 def extract_text_from_bytes(name: str, raw: bytes) -> str:
@@ -124,16 +165,21 @@ def extract_text_from_bytes(name: str, raw: bytes) -> str:
             return _extract_pdf_text(raw)
         if lower.endswith((".txt", ".md")):
             return raw.decode("utf-8", errors="ignore").strip()
+        if lower.endswith((".png", ".jpg", ".jpeg", ".webp")):
+            # A photo/scan of notes uploaded directly (not wrapped in a
+            # PDF) -> OCR it the same way.
+            img = Image.open(io.BytesIO(raw)).convert("RGB")
+            return pytesseract.image_to_string(img).strip()
         return ""
     except Exception:
         return ""
 
 
 def extract_zip_contents(raw_zip: bytes) -> tuple[list[tuple[str, str]], list[str]]:
-    """Unzip in memory and extract text from every .pdf/.txt/.md entry inside.
-    Returns (successes, failures) where successes is a list of
+    """Unzip in memory and extract text from every .pdf/.txt/.md/image entry
+    inside. Returns (successes, failures) where successes is a list of
     (entry_name, text) and failures is a list of entry names that produced
-    no text (corrupt, scanned-image PDF, unsupported type, etc.)."""
+    no text (corrupt, unreadable, unsupported type, etc.)."""
     successes, failures = [], []
     try:
         with zipfile.ZipFile(io.BytesIO(raw_zip)) as zf:
@@ -141,7 +187,9 @@ def extract_zip_contents(raw_zip: bytes) -> tuple[list[tuple[str, str]], list[st
                 if info.is_dir():
                     continue
                 name = info.filename
-                if not name.lower().endswith((".pdf", ".txt", ".md")):
+                if not name.lower().endswith(
+                    (".pdf", ".txt", ".md", ".png", ".jpg", ".jpeg", ".webp")
+                ):
                     continue
                 try:
                     raw = zf.read(name)
@@ -453,7 +501,7 @@ if mode == "chat":
                     newly_attached.append(label)
                 failed.extend(f"{f.name}/{n}" for n in zip_failures)
                 if not successes and not zip_failures:
-                    failed.append(f"{f.name} (no .pdf/.txt/.md files found inside)")
+                    failed.append(f"{f.name} (no supported files found inside)")
             else:
                 text = extract_text_from_bytes(f.name, raw)
                 if text:
@@ -487,8 +535,8 @@ if mode == "chat":
 
         if failed:
             st.warning(f"Couldn't extract text from: {', '.join(failed)} "
-                       f"(likely a scanned/image-only PDF, an unsupported file type inside "
-                       f"the zip, or a corrupt archive — OCR isn't wired up here).")
+                       f"(likely a corrupt file, an unsupported type inside the zip, "
+                       f"or OCR couldn't read the image/handwriting clearly).")
 
         text_history = [m for m in chat["messages"][:-1] if m.get("type", "text") == "text"]
 
