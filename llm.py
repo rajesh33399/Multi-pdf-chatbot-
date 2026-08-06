@@ -35,9 +35,19 @@ GEMINI_IMAGE_MODEL = os.environ.get("GEMINI_IMAGE_MODEL", "gemini-2.5-flash-imag
 # Veo 3.1 preview — the 2.0/3.0 model lines were shut down June 30, 2026.
 GEMINI_VIDEO_MODEL = os.environ.get("GEMINI_VIDEO_MODEL", "veo-3.1-generate-preview")
 
-MAX_CONTEXT_CHARS = int(os.environ.get("MAX_CONTEXT_CHARS", "3500"))
-MAX_HISTORY_CHARS = int(os.environ.get("MAX_HISTORY_CHARS", "400"))
-MAX_OUTPUT_TOKENS = int(os.environ.get("LLM_MAX_TOKENS", "512"))
+# NOTE: previously defaulted to 3500 chars (~700-900 tokens), which silently
+# truncated any document longer than about a page — the tail of a resume
+# (later projects, certifications, etc.) would just never reach the model.
+# Both Groq's llama-3.1-8b-instant (128K token context) and Gemini flash
+# models comfortably handle far more than this. 40000 chars (~8-10K tokens)
+# covers multi-page resumes/documents with plenty of headroom to spare;
+# raise further via the MAX_CONTEXT_CHARS env var if you're routinely
+# feeding it longer documents.
+MAX_CONTEXT_CHARS = int(os.environ.get("MAX_CONTEXT_CHARS", "40000"))
+MAX_HISTORY_CHARS = int(os.environ.get("MAX_HISTORY_CHARS", "800"))
+# Previously 512, which could cut off longer "list everything" style answers
+# mid-sentence. 2048 gives enough room for a full multi-section answer.
+MAX_OUTPUT_TOKENS = int(os.environ.get("LLM_MAX_TOKENS", "2048"))
 
 VIDEO_POLL_SECONDS = int(os.environ.get("VIDEO_POLL_SECONDS", "10"))
 VIDEO_MAX_WAIT_SECONDS = int(os.environ.get("VIDEO_MAX_WAIT_SECONDS", "300"))
@@ -85,7 +95,7 @@ def _get_gemini_client() -> "genai.Client":
 
 
 # ----------------------------------------------------
-# Prompt construction (unchanged from before)
+# Prompt construction
 # ----------------------------------------------------
 def _build_prompt(context: str, question: str, history: Optional[list[dict]] = None) -> tuple:
     context = context.strip()[:MAX_CONTEXT_CHARS]
@@ -171,7 +181,10 @@ def ask_llm_stream(
         for chunk in client.models.generate_content_stream(
             model=GEMINI_TEXT_MODEL,
             contents=contents,
-            config=types.GenerateContentConfig(system_instruction=system_prompt),
+            config=types.GenerateContentConfig(
+                system_instruction=system_prompt,
+                max_output_tokens=MAX_OUTPUT_TOKENS,
+            ),
         ):
             if chunk.text:
                 produced_any = True
