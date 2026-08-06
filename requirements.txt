@@ -8,3 +8,5 @@ Markdown>=3.7,<4
 faiss-cpu
 pytesseract
 sentence-transformers
+pymupdf
+Pillow
