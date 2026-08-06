@@ -23,14 +23,16 @@ scale, prefer HF PRO / Inference Endpoints (a paid, properly-provisioned
 rate limit) over more free accounts.
 """
 
+import io
 import logging
 import os
 import random
 import time
 from typing import Iterator, Optional
 
-import requests
 import streamlit as st
+from huggingface_hub import InferenceClient
+from huggingface_hub.errors import HfHubHTTPError
 from langchain_groq import ChatGroq
 from google import genai
 from google.genai import types
@@ -45,12 +47,19 @@ AI_PROVIDER = os.environ.get("AI_PROVIDER", "groq")
 GROQ_MODEL = os.environ.get("GROQ_MODEL", "llama-3.1-8b-instant")
 GEMINI_TEXT_MODEL = os.environ.get("GEMINI_TEXT_MODEL", "gemini-3.6-flash")
 
-# Hugging Face Inference API models (override via env vars if you want a
-# different checkpoint). These are the model IDs used in the HF router URL:
-# https://api-inference.huggingface.co/models/<model_id>
+# Hugging Face Inference Providers — model IDs. As of mid-2025, HF's old
+# legacy REST endpoint (api-inference.huggingface.co/models/<id>) mostly
+# only serves small CPU models; GPU diffusion/video models are only
+# reachable through Inference Providers routing (huggingface_hub's
+# InferenceClient), which picks a real backend (fal-ai, Together,
+# Replicate, etc.) to actually run the model. Override via env vars.
 HF_IMAGE_MODEL = os.environ.get("HF_IMAGE_MODEL", "black-forest-labs/FLUX.1-schnell")
-HF_VIDEO_MODEL = os.environ.get("HF_VIDEO_MODEL", "damo-vilab/text-to-video-ms-1.7b")
-HF_API_BASE = "https://api-inference.huggingface.co/models"
+HF_VIDEO_MODEL = os.environ.get("HF_VIDEO_MODEL", "Wan-AI/Wan2.2-T2V-A14B")
+# Provider to route through. "auto" lets HF pick the fastest available
+# provider that serves the model; you can pin one (e.g. "fal-ai",
+# "together", "replicate") if you want consistent behavior/pricing.
+HF_IMAGE_PROVIDER = os.environ.get("HF_IMAGE_PROVIDER", "auto")
+HF_VIDEO_PROVIDER = os.environ.get("HF_VIDEO_PROVIDER", "auto")
 
 # How long (seconds) to let a token "cool down" after it gets rate-limited
 # before we try it again.
@@ -132,13 +141,20 @@ def _mark_hf_token_limited(token: str) -> None:
     _hf_token_cooldowns[token] = time.time() + HF_RATE_LIMIT_COOLDOWN
 
 
-def _hf_request(model: str, payload: dict, accept: str, timeout: int = 60) -> bytes:
-    """POSTs to the HF Inference API, rotating through all available tokens
-    on rate limits (429) or auth errors (401/403) before giving up. Also
-    handles HF's "model is loading" response by waiting and retrying on
-    the same token.
+def _hf_status_code(exc: Exception) -> Optional[int]:
+    """Best-effort extraction of an HTTP status code from an
+    HfHubHTTPError (or any exception carrying a `.response`)."""
+    resp = getattr(exc, "response", None)
+    return getattr(resp, "status_code", None) if resp is not None else None
 
-    Returns raw response bytes (image or video) on success.
+
+def _hf_call_with_rotation(fn, model: str, provider: str):
+    """Calls `fn(client)` (client = InferenceClient for one token), rotating
+    through every token in HF_API_KEYS on rate limits (429) or auth errors
+    (401/403) before giving up. On a "model loading" (503) response it
+    retries the SAME token a few times instead of burning through others.
+    Any other error is logged with its real detail and the next token is
+    tried — nothing gets silently swallowed into a generic message.
     """
     keys = _get_hf_api_keys()
     if not keys:
@@ -149,53 +165,49 @@ def _hf_request(model: str, payload: dict, accept: str, timeout: int = 60) -> by
 
     tried: set[str] = set()
     last_error: Optional[Exception] = None
-    url = f"{HF_API_BASE}/{model}"
 
     while len(tried) < len(keys):
         token = _pick_hf_token([k for k in keys if k not in tried] or keys)
         tried.add(token)
-        headers = {"Authorization": f"Bearer {token}", "Accept": accept}
+        client = InferenceClient(provider=provider, api_key=token)
 
         waited_for_load = 0
         while True:
             try:
-                resp = requests.post(url, headers=headers, json=payload, timeout=timeout)
-            except requests.RequestException as e:
+                return fn(client)
+            except HfHubHTTPError as e:
+                status = _hf_status_code(e)
+                detail = str(e)
+
+                if status == 429:
+                    logger.warning("HF token rate-limited, rotating to next token.")
+                    _mark_hf_token_limited(token)
+                    last_error = e
+                    break  # try next token
+
+                if status in (401, 403):
+                    logger.warning("HF token invalid/unauthorized (%s): %s", status, detail)
+                    last_error = e
+                    break  # try next token
+
+                if status == 503:
+                    if waited_for_load >= HF_MODEL_LOAD_TIMEOUT:
+                        last_error = TimeoutError("Model load timed out on Hugging Face.")
+                        break
+                    time.sleep(10)
+                    waited_for_load += 10
+                    continue  # retry same token — model is cold-starting
+
+                # Any other status — log the REAL detail (model not found,
+                # no provider available, bad payload, etc.) instead of
+                # masking it, then try the next token.
+                logger.warning("HF request failed (status=%s): %s", status, detail)
                 last_error = e
+                break
+            except Exception as e:
                 logger.warning("HF request failed on a token, trying next: %s", e)
-                break  # try next token
-
-            if resp.status_code == 200:
-                return resp.content
-
-            if resp.status_code == 429:
-                logger.warning("HF token rate-limited, rotating to next token.")
-                _mark_hf_token_limited(token)
-                last_error = RuntimeError("Rate limited (429)")
-                break  # try next token
-
-            if resp.status_code in (401, 403):
-                logger.warning("HF token invalid/unauthorized, rotating to next token.")
-                last_error = RuntimeError(f"HF auth error ({resp.status_code})")
-                break  # try next token
-
-            if resp.status_code == 503:
-                # Model is cold-starting on HF's infra — wait and retry the
-                # SAME token/model rather than burning through other tokens.
-                try:
-                    wait_s = min(resp.json().get("estimated_time", 10), 20)
-                except Exception:
-                    wait_s = 10
-                if waited_for_load >= HF_MODEL_LOAD_TIMEOUT:
-                    last_error = TimeoutError("Model load timed out on Hugging Face.")
-                    break
-                time.sleep(wait_s)
-                waited_for_load += wait_s
-                continue  # retry same token
-
-            # Any other error — surface it and try the next token.
-            last_error = RuntimeError(f"HF error {resp.status_code}: {resp.text[:300]}")
-            break
+                last_error = e
+                break
 
     raise RuntimeError(
         f"All {len(keys)} Hugging Face token(s) failed. Last error: {last_error}"
@@ -324,23 +336,28 @@ def ask_llm(context: str, question: str, history: Optional[list[dict]] = None) -
 # Image generation — Hugging Face Inference API, rotating across tokens.
 # ----------------------------------------------------
 def generate_image(prompt: str) -> bytes:
-    """Generate an image from a text prompt via Hugging Face. Returns raw
-    image bytes (PNG/JPEG). Rotates across every token in HF_API_KEYS,
-    skipping any token that's currently cooling down from a recent 429.
+    """Generate an image from a text prompt via Hugging Face Inference
+    Providers. Returns raw PNG bytes. Rotates across every token in
+    HF_API_KEYS, skipping any token that's currently cooling down from a
+    recent 429.
 
     Raises ImageGenerationUnavailable if every configured token is
-    rate-limited or unauthorized right now.
+    rate-limited/unauthorized, or no provider currently serves the model.
     """
+    def _call(client: InferenceClient):
+        image = client.text_to_image(prompt, model=HF_IMAGE_MODEL)
+        buf = io.BytesIO()
+        image.save(buf, format="PNG")
+        return buf.getvalue()
+
     try:
-        return _hf_request(
-            model=HF_IMAGE_MODEL,
-            payload={"inputs": prompt},
-            accept="image/png",
-        )
+        return _hf_call_with_rotation(_call, model=HF_IMAGE_MODEL, provider=HF_IMAGE_PROVIDER)
     except RuntimeError as e:
+        logger.exception("Image generation failed on every HF token")
         raise ImageGenerationUnavailable(
-            "Image generation is temporarily unavailable — all configured "
-            "Hugging Face tokens are rate-limited or invalid right now. "
+            "Image generation is temporarily unavailable — see the app logs "
+            "for the real error from Hugging Face (invalid token, no "
+            "provider serving this model, or genuine rate limiting). "
             "Please try again in a minute."
         ) from e
 
@@ -349,26 +366,26 @@ def generate_image(prompt: str) -> bytes:
 # Video generation — Hugging Face Inference API, rotating across tokens.
 # ----------------------------------------------------
 def generate_video(prompt: str) -> bytes:
-    """Generate a video from a text prompt via Hugging Face. Returns raw
-    MP4 bytes. Note: free-tier text-to-video models on HF's Inference API
-    are slower and less reliable than image models — expect longer waits
-    and occasional failures on cold starts.
+    """Generate a video from a text prompt via Hugging Face Inference
+    Providers. Returns raw MP4 bytes. Note: text-to-video models are
+    slower and less consistently available across providers than image
+    models — expect longer waits and occasional failures.
 
     Raises VideoGenerationUnavailable if every configured token is
-    rate-limited or unauthorized right now.
+    rate-limited/unauthorized, or no provider currently serves the model.
     """
+    def _call(client: InferenceClient):
+        return client.text_to_video(prompt, model=HF_VIDEO_MODEL)
+
     try:
-        return _hf_request(
-            model=HF_VIDEO_MODEL,
-            payload={"inputs": prompt},
-            accept="video/mp4",
-            timeout=120,
-        )
+        return _hf_call_with_rotation(_call, model=HF_VIDEO_MODEL, provider=HF_VIDEO_PROVIDER)
     except RuntimeError as e:
+        logger.exception("Video generation failed on every HF token")
         raise VideoGenerationUnavailable(
-            "Video generation is temporarily unavailable — all configured "
-            "Hugging Face tokens are rate-limited or invalid right now, or "
-            "the model is still loading. Please try again shortly."
+            "Video generation is temporarily unavailable — see the app logs "
+            "for the real error from Hugging Face (invalid token, no "
+            "provider serving this model, or genuine rate limiting). "
+            "Please try again shortly."
         ) from e
 
 
