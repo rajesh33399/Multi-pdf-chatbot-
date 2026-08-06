@@ -1,18 +1,35 @@
 """
 llm.py — Cloud AI orchestration: Groq + Gemini (text) via LangChain/google-genai,
-plus Gemini image generation (Nano Banana) and video generation (Veo).
+plus Hugging Face Inference API for image generation and video generation,
+with rotation across multiple HF API tokens for resilience against
+per-token rate limits.
 
 NOTE ON SDK MIGRATION: this file previously used `google.generativeai`, which
 Google deprecated on Nov 30, 2025 and does not support image/video generation
 at all. It has been migrated to the current unified `google-genai` SDK
-(`from google import genai`), which is required for Nano Banana / Veo access.
+(`from google import genai`) for text chat, and to Hugging Face's Inference
+API for image/video generation.
+
+IMPORTANT — on multi-account key rotation:
+Rotating across several HF tokens that belong to a *single* account (e.g.
+separate tokens with different scopes, or a paid + free token) is fine.
+Rotating across tokens from many separate accounts created specifically to
+dodge one account's rate limit is against Hugging Face's Terms of Service
+(most providers, HF included, prohibit multi-accounting to bypass limits),
+and can get those accounts flagged/banned. This code will happily rotate
+through however many tokens you give it — that policy risk is on the token
+list you supply, not something this code can fix. For real production
+scale, prefer HF PRO / Inference Endpoints (a paid, properly-provisioned
+rate limit) over more free accounts.
 """
 
 import logging
 import os
+import random
 import time
 from typing import Iterator, Optional
 
+import requests
 import streamlit as st
 from langchain_groq import ChatGroq
 from google import genai
@@ -26,56 +43,167 @@ logger = logging.getLogger(__name__)
 AI_PROVIDER = os.environ.get("AI_PROVIDER", "groq")
 
 GROQ_MODEL = os.environ.get("GROQ_MODEL", "llama-3.1-8b-instant")
-# Current GA flash model as of mid-2026. Override via env var if Google ships
-# a newer default before this code is updated again.
 GEMINI_TEXT_MODEL = os.environ.get("GEMINI_TEXT_MODEL", "gemini-3.6-flash")
-# "Nano Banana" — Google's own migration guidance is to use this native
-# multimodal model via generate_content, NOT the deprecated Imagen endpoint.
-GEMINI_IMAGE_MODEL = os.environ.get("GEMINI_IMAGE_MODEL", "gemini-2.5-flash-image")
-# Veo 3.1 preview — the 2.0/3.0 model lines were shut down June 30, 2026.
-GEMINI_VIDEO_MODEL = os.environ.get("GEMINI_VIDEO_MODEL", "veo-3.1-generate-preview")
 
-# NOTE: previously defaulted to 3500 chars (~700-900 tokens), which silently
-# truncated any document longer than about a page — the tail of a resume
-# (later projects, certifications, etc.) would just never reach the model.
-# Both Groq's llama-3.1-8b-instant (128K token context) and Gemini flash
-# models comfortably handle far more than this. 40000 chars (~8-10K tokens)
-# covers multi-page resumes/documents with plenty of headroom to spare;
-# raise further via the MAX_CONTEXT_CHARS env var if you're routinely
-# feeding it longer documents.
+# Hugging Face Inference API models (override via env vars if you want a
+# different checkpoint). These are the model IDs used in the HF router URL:
+# https://api-inference.huggingface.co/models/<model_id>
+HF_IMAGE_MODEL = os.environ.get("HF_IMAGE_MODEL", "black-forest-labs/FLUX.1-schnell")
+HF_VIDEO_MODEL = os.environ.get("HF_VIDEO_MODEL", "damo-vilab/text-to-video-ms-1.7b")
+HF_API_BASE = "https://api-inference.huggingface.co/models"
+
+# How long (seconds) to let a token "cool down" after it gets rate-limited
+# before we try it again.
+HF_RATE_LIMIT_COOLDOWN = int(os.environ.get("HF_RATE_LIMIT_COOLDOWN", "60"))
+# How long to wait for a cold model to finish loading on HF's side.
+HF_MODEL_LOAD_TIMEOUT = int(os.environ.get("HF_MODEL_LOAD_TIMEOUT", "120"))
+
 MAX_CONTEXT_CHARS = int(os.environ.get("MAX_CONTEXT_CHARS", "40000"))
 MAX_HISTORY_CHARS = int(os.environ.get("MAX_HISTORY_CHARS", "800"))
-# Previously 512, which could cut off longer "list everything" style answers
-# mid-sentence. 2048 gives enough room for a full multi-section answer.
 MAX_OUTPUT_TOKENS = int(os.environ.get("LLM_MAX_TOKENS", "2048"))
-
-VIDEO_POLL_SECONDS = int(os.environ.get("VIDEO_POLL_SECONDS", "10"))
-VIDEO_MAX_WAIT_SECONDS = int(os.environ.get("VIDEO_MAX_WAIT_SECONDS", "300"))
 
 
 class VideoGenerationUnavailable(Exception):
-    """Raised when the configured API key/plan can't access video generation.
-    app.py should catch this specifically and show a clear, honest message
-    instead of a generic error — Veo access is gated by Google independently
-    of anything in this code."""
+    """Raised when no working HF token/model is available for video."""
 
 
 class ImageGenerationUnavailable(Exception):
-    """Raised when the configured API key/plan has zero quota for image
-    generation (e.g. free-tier keys with limit: 0 on gemini-*-image models).
-    This is a Google-side billing/plan restriction, not a bug — app.py
-    should show a clear, honest message instead of the raw API error."""
-
-
-def _is_quota_or_permission_error(msg: str) -> bool:
-    return any(s in msg for s in (
-        "PERMISSION_DENIED", "403", "not allowed", "not enabled",
-        "quota", "RESOURCE_EXHAUSTED", "429",
-    ))
+    """Raised when no working HF token/model is available for images."""
 
 
 # ----------------------------------------------------
-# Gemini client (cached — one client per process, not per call)
+# Hugging Face token rotation
+# ----------------------------------------------------
+# In-memory cooldown tracker: {token: unix_timestamp_until_which_it's_cold}
+# This resets whenever the process restarts, which is fine — it's just
+# meant to avoid hammering a token that *just* got a 429.
+_hf_token_cooldowns: dict[str, float] = {}
+
+
+def _get_hf_api_keys() -> list[str]:
+    """Reads HF tokens from st.secrets or env var.
+
+    Supports either:
+      - HF_API_KEYS as a TOML array in secrets.toml:
+            HF_API_KEYS = ["hf_abc...", "hf_def...", ...]
+      - HF_API_KEYS as a comma-separated string (env var or secrets.toml):
+            HF_API_KEYS = "hf_abc...,hf_def...,hf_ghi..."
+      - A single HF_API_KEY as a fallback.
+    """
+    raw = None
+    try:
+        raw = st.secrets.get("HF_API_KEYS")
+    except Exception:
+        raw = None
+    if raw is None:
+        raw = os.environ.get("HF_API_KEYS")
+
+    keys: list[str] = []
+    if isinstance(raw, (list, tuple)):
+        keys = [str(k).strip() for k in raw if str(k).strip()]
+    elif isinstance(raw, str) and raw.strip():
+        keys = [k.strip() for k in raw.split(",") if k.strip()]
+
+    if not keys:
+        single = None
+        try:
+            single = st.secrets.get("HF_API_KEY")
+        except Exception:
+            single = None
+        single = single or os.environ.get("HF_API_KEY")
+        if single:
+            keys = [single.strip()]
+
+    return keys
+
+
+def _pick_hf_token(keys: list[str]) -> str:
+    """Pick a token that isn't currently cooling down, preferring a random
+    one so load is spread across all tokens rather than always hitting
+    token[0] first. Falls back to the token whose cooldown ends soonest."""
+    now = time.time()
+    fresh = [k for k in keys if _hf_token_cooldowns.get(k, 0) <= now]
+    if fresh:
+        return random.choice(fresh)
+    return min(keys, key=lambda k: _hf_token_cooldowns.get(k, 0))
+
+
+def _mark_hf_token_limited(token: str) -> None:
+    _hf_token_cooldowns[token] = time.time() + HF_RATE_LIMIT_COOLDOWN
+
+
+def _hf_request(model: str, payload: dict, accept: str, timeout: int = 60) -> bytes:
+    """POSTs to the HF Inference API, rotating through all available tokens
+    on rate limits (429) or auth errors (401/403) before giving up. Also
+    handles HF's "model is loading" response by waiting and retrying on
+    the same token.
+
+    Returns raw response bytes (image or video) on success.
+    """
+    keys = _get_hf_api_keys()
+    if not keys:
+        raise RuntimeError(
+            "No Hugging Face API token configured. Set HF_API_KEYS (list or "
+            "comma-separated) or HF_API_KEY in Streamlit secrets."
+        )
+
+    tried: set[str] = set()
+    last_error: Optional[Exception] = None
+    url = f"{HF_API_BASE}/{model}"
+
+    while len(tried) < len(keys):
+        token = _pick_hf_token([k for k in keys if k not in tried] or keys)
+        tried.add(token)
+        headers = {"Authorization": f"Bearer {token}", "Accept": accept}
+
+        waited_for_load = 0
+        while True:
+            try:
+                resp = requests.post(url, headers=headers, json=payload, timeout=timeout)
+            except requests.RequestException as e:
+                last_error = e
+                logger.warning("HF request failed on a token, trying next: %s", e)
+                break  # try next token
+
+            if resp.status_code == 200:
+                return resp.content
+
+            if resp.status_code == 429:
+                logger.warning("HF token rate-limited, rotating to next token.")
+                _mark_hf_token_limited(token)
+                last_error = RuntimeError("Rate limited (429)")
+                break  # try next token
+
+            if resp.status_code in (401, 403):
+                logger.warning("HF token invalid/unauthorized, rotating to next token.")
+                last_error = RuntimeError(f"HF auth error ({resp.status_code})")
+                break  # try next token
+
+            if resp.status_code == 503:
+                # Model is cold-starting on HF's infra — wait and retry the
+                # SAME token/model rather than burning through other tokens.
+                try:
+                    wait_s = min(resp.json().get("estimated_time", 10), 20)
+                except Exception:
+                    wait_s = 10
+                if waited_for_load >= HF_MODEL_LOAD_TIMEOUT:
+                    last_error = TimeoutError("Model load timed out on Hugging Face.")
+                    break
+                time.sleep(wait_s)
+                waited_for_load += wait_s
+                continue  # retry same token
+
+            # Any other error — surface it and try the next token.
+            last_error = RuntimeError(f"HF error {resp.status_code}: {resp.text[:300]}")
+            break
+
+    raise RuntimeError(
+        f"All {len(keys)} Hugging Face token(s) failed. Last error: {last_error}"
+    )
+
+
+# ----------------------------------------------------
+# Gemini client (text chat only — cached, one client per process)
 # ----------------------------------------------------
 _gemini_client: Optional["genai.Client"] = None
 
@@ -124,9 +252,7 @@ def _build_prompt(context: str, question: str, history: Optional[list[dict]] = N
 
 
 # ----------------------------------------------------
-# Text chat: Groq first, Gemini fallback. If images are attached, Groq is
-# skipped entirely — ChatGroq's model here is text-only, so a turn with an
-# image has to go straight to Gemini or the image would be silently dropped.
+# Text chat: Groq first, Gemini fallback.
 # ----------------------------------------------------
 def ask_llm_stream(
     context: str,
@@ -134,12 +260,6 @@ def ask_llm_stream(
     history: Optional[list[dict]] = None,
     images: Optional[list[tuple[bytes, str]]] = None,
 ) -> Iterator[str]:
-    """Generator — yields text chunks using Groq or Gemini based on configuration/keys.
-
-    `images` is an optional list of (raw_bytes, mime_type) tuples, e.g. from
-    an uploaded PNG/JPEG. When present, this always routes to Gemini, since
-    Groq's chat model here has no vision capability.
-    """
     system_prompt, user_prompt = _build_prompt(context, question, history)
 
     if not images:
@@ -197,98 +317,59 @@ def ask_llm_stream(
 
 
 def ask_llm(context: str, question: str, history: Optional[list[dict]] = None) -> str:
-    """Blocking call — returns the full answer as a string by consuming the stream."""
     return "".join(list(ask_llm_stream(context, question, history)))
 
 
 # ----------------------------------------------------
-# Image generation (Gemini "Nano Banana") — always via Gemini,
-# regardless of AI_PROVIDER, since Groq has no image generation.
+# Image generation — Hugging Face Inference API, rotating across tokens.
 # ----------------------------------------------------
 def generate_image(prompt: str) -> bytes:
-    """Generate an image from a text prompt. Returns raw image bytes (PNG/JPEG).
+    """Generate an image from a text prompt via Hugging Face. Returns raw
+    image bytes (PNG/JPEG). Rotates across every token in HF_API_KEYS,
+    skipping any token that's currently cooling down from a recent 429.
 
-    Raises ImageGenerationUnavailable if the API key/plan has no quota for
-    image generation — as of mid-2026, Google's free Gemini API tier gives
-    a quota of 0 requests/day for gemini-2.5-flash-image, so this requires
-    a paid plan with billing enabled. Callers should catch this specifically
-    and show a plain message rather than the raw API error.
+    Raises ImageGenerationUnavailable if every configured token is
+    rate-limited or unauthorized right now.
     """
-    client = _get_gemini_client()
     try:
-        response = client.models.generate_content(
-            model=GEMINI_IMAGE_MODEL,
-            contents=prompt,
-            config=types.GenerateContentConfig(response_modalities=["Text", "Image"]),
+        return _hf_request(
+            model=HF_IMAGE_MODEL,
+            payload={"inputs": prompt},
+            accept="image/png",
         )
-    except Exception as e:
-        msg = str(e)
-        if any(s in msg for s in ("RESOURCE_EXHAUSTED", "429", "quota", "PERMISSION_DENIED")):
-            raise ImageGenerationUnavailable(
-                "Image generation isn't available on your current Gemini API plan. "
-                "Free-tier keys currently have zero quota for image generation — "
-                "this needs a paid Gemini API plan with billing enabled."
-            ) from e
-        raise
-
-    candidates = getattr(response, "candidates", None) or []
-    if not candidates:
-        raise RuntimeError("Gemini returned no candidates for this image prompt.")
-    parts = getattr(candidates[0].content, "parts", None) or []
-    for part in parts:
-        inline_data = getattr(part, "inline_data", None)
-        if inline_data is not None and inline_data.data:
-            return inline_data.data
-    raise RuntimeError("Gemini did not return image data for this prompt — try rephrasing it.")
+    except RuntimeError as e:
+        raise ImageGenerationUnavailable(
+            "Image generation is temporarily unavailable — all configured "
+            "Hugging Face tokens are rate-limited or invalid right now. "
+            "Please try again in a minute."
+        ) from e
 
 
 # ----------------------------------------------------
-# Video generation (Veo) — always via Gemini. Async: submit, poll, retrieve.
+# Video generation — Hugging Face Inference API, rotating across tokens.
 # ----------------------------------------------------
 def generate_video(prompt: str) -> bytes:
-    """Generate a video from a text prompt. BLOCKING — polls until the async
-    job completes or times out. Returns raw MP4 bytes.
+    """Generate a video from a text prompt via Hugging Face. Returns raw
+    MP4 bytes. Note: free-tier text-to-video models on HF's Inference API
+    are slower and less reliable than image models — expect longer waits
+    and occasional failures on cold starts.
 
-    Raises VideoGenerationUnavailable if the API key/plan can't reach Veo
-    (this is gated by Google independently of this code — a paid/allowlisted
-    tier may be required). Callers should catch this specifically and show a
-    plain "not available on your plan" message rather than a generic error.
+    Raises VideoGenerationUnavailable if every configured token is
+    rate-limited or unauthorized right now.
     """
-    client = _get_gemini_client()
-
     try:
-        operation = client.models.generate_videos(
-            model=GEMINI_VIDEO_MODEL,
-            prompt=prompt,
-            config=types.GenerateVideosConfig(number_of_videos=1, duration_seconds=5),
+        return _hf_request(
+            model=HF_VIDEO_MODEL,
+            payload={"inputs": prompt},
+            accept="video/mp4",
+            timeout=120,
         )
-    except Exception as e:
-        msg = str(e)
-        if any(s in msg for s in ("PERMISSION_DENIED", "403", "not allowed", "not enabled", "quota")):
-            raise VideoGenerationUnavailable(
-                "Video generation isn't available on your current Gemini API plan/key."
-            ) from e
-        raise
-
-    waited = 0
-    while not operation.done:
-        if waited >= VIDEO_MAX_WAIT_SECONDS:
-            raise TimeoutError(
-                f"Video generation exceeded the {VIDEO_MAX_WAIT_SECONDS}s wait limit and timed out."
-            )
-        time.sleep(VIDEO_POLL_SECONDS)
-        waited += VIDEO_POLL_SECONDS
-        operation = client.operations.get(operation)
-
-    generated = getattr(operation.response, "generated_videos", None) or []
-    if not generated:
-        raise RuntimeError("Gemini did not return a video for this prompt — try rephrasing it.")
-
-    video_obj = generated[0].video
-    video_bytes = getattr(video_obj, "video_bytes", None)
-    if video_bytes:
-        return video_bytes
-    raise RuntimeError("Could not read generated video bytes from the API response.")
+    except RuntimeError as e:
+        raise VideoGenerationUnavailable(
+            "Video generation is temporarily unavailable — all configured "
+            "Hugging Face tokens are rate-limited or invalid right now, or "
+            "the model is still loading. Please try again shortly."
+        ) from e
 
 
 # ----------------------------------------------------
