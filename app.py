@@ -506,59 +506,72 @@ for message in chat["messages"]:
 
 # ---- input + generation, branched by mode ----
 if mode == "chat":
-    submission = st.chat_input(
-        "Ask SparkAI",
-        accept_file="multiple",
-        file_type=["pdf", "txt", "md", "zip", "png", "jpg", "jpeg", "webp"],
-    )
+    chat.setdefault("processed_files", set())
 
-    if submission:
-        prompt = (submission.text or "").strip()
-        files = submission.files or []
+    # Separate st.file_uploader instead of st.chat_input(accept_file=...).
+    # chat_input's built-in attach flow has been unreliable on mobile
+    # (files get flagged red / rejected regardless of size) — file_uploader
+    # is Streamlit's oldest, most battle-tested upload widget and gives
+    # actual error feedback instead of a silent red badge.
+    with st.expander("📎 Attach files (PDF, TXT, MD, ZIP, images)", expanded=False):
+        uploaded = st.file_uploader(
+            "Attach files",
+            type=["pdf", "txt", "md", "zip", "png", "jpg", "jpeg", "webp"],
+            accept_multiple_files=True,
+            label_visibility="collapsed",
+            key=f"uploader_{st.session_state.current_chat_id}",
+        )
 
-        doc_files = [f for f in files if not f.type.startswith("image/")]
-        image_files = [f for f in files if f.type.startswith("image/")]
+    prompt = st.chat_input("Ask SparkAI")
 
-        newly_attached, failed = [], []
+    newly_attached, failed, pending_images = [], [], []
 
-        for f in doc_files:
-            if f.name in chat["uploaded_files"]:
-                continue
-            raw = f.read()
-            if f.name.lower().endswith(".zip"):
-                successes, zip_failures = extract_zip_contents(raw)
-                chat["uploaded_files"].append(f.name)
-                for entry_name, text in successes:
-                    label = f"{f.name}/{entry_name}"
-                    chat["context"] = (chat["context"] + f"\n\n--- {label} ---\n{text}").strip()
-                    newly_attached.append(label)
-                failed.extend(f"{f.name}/{n}" for n in zip_failures)
-                if not successes and not zip_failures:
-                    failed.append(f"{f.name} (no supported files found inside)")
-            else:
-                text = extract_text_from_bytes(f.name, raw)
-                if text:
-                    chat["context"] = (chat["context"] + f"\n\n--- {f.name} ---\n{text}").strip()
-                    chat["uploaded_files"].append(f.name)
-                    newly_attached.append(f.name)
-                else:
-                    failed.append(f.name)
+    for f in (uploaded or []):
+        # Dedup against BOTH successes and prior failures so a failed file
+        # doesn't get silently re-processed (and re-OCR'd) on every rerun —
+        # file_uploader keeps returning the same files across reruns until
+        # the user removes them, unlike chat_input's one-shot submission.
+        if f.name in chat["processed_files"]:
+            continue
+        chat["processed_files"].add(f.name)
 
-        # Images go straight to the model as image data (not text-extracted).
-        # This only actually reaches the model on the Gemini path — see
-        # llm.py's ask_llm_stream, since Groq's chat model is text-only.
-        pending_images = []
-        for f in image_files:
-            pending_images.append((f.read(), f.type))
-            if f.name not in chat["uploaded_files"]:
+        raw = f.getvalue()
+        if f.type.startswith("image/"):
+            # Images go straight to the model as image data (not
+            # text-extracted). This only actually reaches the model on the
+            # Gemini path — see llm.py's ask_llm_stream, since Groq's chat
+            # model is text-only.
+            pending_images.append((raw, f.type))
+            chat["uploaded_files"].append(f.name)
+            newly_attached.append(f.name)
+        elif f.name.lower().endswith(".zip"):
+            successes, zip_failures = extract_zip_contents(raw)
+            chat["uploaded_files"].append(f.name)
+            for entry_name, text in successes:
+                label = f"{f.name}/{entry_name}"
+                chat["context"] = (chat["context"] + f"\n\n--- {label} ---\n{text}").strip()
+                newly_attached.append(label)
+            failed.extend(f"{f.name}/{n}" for n in zip_failures)
+            if not successes and not zip_failures:
+                failed.append(f"{f.name} (no supported files found inside)")
+        else:
+            text = extract_text_from_bytes(f.name, raw)
+            if text:
+                chat["context"] = (chat["context"] + f"\n\n--- {f.name} ---\n{text}").strip()
                 chat["uploaded_files"].append(f.name)
                 newly_attached.append(f.name)
+            else:
+                failed.append(f.name)
 
-        if not prompt:
-            prompt = "Summarize the attached file(s) and highlight anything important."
+    # Fire a turn either when the user typed something and hit send, OR
+    # when new files just landed (auto-summarize them, same as before).
+    if prompt or newly_attached or failed:
+        effective_prompt = (prompt or "").strip()
+        if not effective_prompt:
+            effective_prompt = "Summarize the attached file(s) and highlight anything important."
 
-        _maybe_set_title_from_prompt(prompt)
-        display_prompt = prompt
+        _maybe_set_title_from_prompt(effective_prompt)
+        display_prompt = effective_prompt
         if newly_attached:
             display_prompt += "\n\n📎 " + ", ".join(newly_attached)
         chat["messages"].append({"role": "user", "type": "text", "content": display_prompt})
@@ -576,7 +589,7 @@ if mode == "chat":
         response_container = st.empty()
         full_response = ""
         for chunk in ask_llm_stream(
-            context=chat["context"], question=prompt,
+            context=chat["context"], question=effective_prompt,
             history=text_history, images=pending_images or None,
         ):
             full_response += chunk
