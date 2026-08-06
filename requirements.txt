@@ -10,3 +10,4 @@ pytesseract
 sentence-transformers
 pymupdf
 Pillow
+huggingface_hub
