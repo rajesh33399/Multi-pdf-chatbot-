@@ -179,21 +179,6 @@ def _render_copy_icon(text: str, key: str) -> None:
     _render_js_icon_button("content_copy", onclick, key=key, title="Copy")
 
 
-def _render_more_menu_trigger(target_id: str, key: str) -> None:
-    """The '⋯' trigger. st.popover can't go borderless (no type='tertiary'
-    support — open Streamlit feature request #10416), so this instead
-    toggles the CSS visibility of a real, Python-wired button row
-    rendered separately right after it (see render_assistant_message_
-    actions) by reaching into the parent page's DOM. The component iframe
-    and the main Streamlit page are same-origin, so this works reliably —
-    the revealed buttons are genuine st.button widgets, not fake UI."""
-    onclick = (
-        f"var m = window.parent.document.getElementById('{target_id}'); "
-        f"if (m) {{ m.style.display = (m.style.display === 'none' || m.style.display === '') ? 'block' : 'none'; }}"
-    )
-    _render_js_icon_button("more_horiz", onclick, key=key, title="More")
-
-
 def render_user_message_actions(chat_id: str, idx: int, content: str) -> None:
     """Copy + Edit row under a user message, matching Gemini's icon order
     and instant-copy behavior exactly."""
@@ -219,9 +204,8 @@ def render_assistant_message_actions(chat_id: str, idx: int, content: str, messa
     highlights AND opens a 'What went wrong?' card with reason pills
     (Gemini's actual bad-response flow, not just a color change); copy is
     instant client-side (no visible box); regenerate is its own icon
-    (Gemini doesn't tuck it behind '⋯'); '⋯' reveals Report, via the
-    same real-hidden-button trick used throughout since st.popover can't
-    go borderless."""
+    (Gemini doesn't tuck it behind '⋯'); '⋯' is a real st.popover holding
+    Report — no more custom JS/iframe DOM-reaching hack."""
     col_up, col_down, col_regen, col_copy, col_more, _spacer = st.columns(
         [1, 1, 1, 1, 1, 12], gap="small"
     )
@@ -252,17 +236,12 @@ def render_assistant_message_actions(chat_id: str, idx: int, content: str, messa
     with col_copy:
         _render_copy_icon(content, key=f"copyassistant_{chat_id}_{idx}")
     with col_more:
-        target_id = f"morewrap_{chat_id}_{idx}"
-        _render_more_menu_trigger(target_id, key=f"more_{chat_id}_{idx}")
-
-    # Hidden-by-default row of REAL buttons that the "⋯" JS toggle reveals.
-    st.markdown(f'<div id="morewrap_{chat_id}_{idx}" style="display:none;">', unsafe_allow_html=True)
-    col_report, _sp2 = st.columns([1, 15], gap="small")
-    with col_report:
-        if st.button(" ", icon=":material/flag:", key=f"report_{chat_id}_{idx}",
-                      type="tertiary", help="Report an issue"):
-            st.toast("Thanks — this has been noted.")
-    st.markdown('</div>', unsafe_allow_html=True)
+        with st.popover(" ", icon=":material/more_vert:", type="tertiary",
+                         use_container_width=False, help="More"):
+            if st.button("Report an issue", icon=":material/flag:",
+                         key=f"report_{chat_id}_{idx}", type="tertiary",
+                         use_container_width=True):
+                st.toast("Thanks — this has been noted.")
 
     # "What went wrong?" reason card — Gemini's actual bad-response flow,
     # shown right under the icon row when thumbs-down is active.
@@ -672,7 +651,13 @@ def _stream_assistant_reply(prompt: str, images=None) -> None:
     'edit message' resend path (see the edit UI in the render loop below),
     so both regenerate a response the exact same way. Assumes the user's
     message has ALREADY been appended to chat["messages"] — history is
-    built from everything before it."""
+    built from everything before it.
+
+    Also renders the new message's action row (👍/👎/copy/etc.) right
+    away — without this, the row only appeared on the render loop at the
+    TOP of the script, which doesn't run again until the next interaction,
+    so actions looked like they were missing on the message you just got
+    and only "caught up" a turn later."""
     text_history = [m for m in chat["messages"][:-1] if m.get("type", "text") == "text"]
     response_container = st.empty()
     full_response = ""
@@ -683,7 +668,9 @@ def _stream_assistant_reply(prompt: str, images=None) -> None:
         full_response += chunk
         response_container.markdown(_build_bubble_html("assistant", full_response + "▌"), unsafe_allow_html=True)
     response_container.markdown(_build_bubble_html("assistant", full_response), unsafe_allow_html=True)
-    chat["messages"].append({"role": "assistant", "type": "text", "content": full_response})
+    new_message = {"role": "assistant", "type": "text", "content": full_response}
+    chat["messages"].append(new_message)
+    render_assistant_message_actions(chat_id, len(chat["messages"]) - 1, full_response, new_message)
 
 
 chat_id = st.session_state.current_chat_id
@@ -854,6 +841,7 @@ if mode == "chat":
         render_message_bubble("user", display_prompt)
         for img_bytes, _mime in pending_images:
             st.image(img_bytes, width=220)
+        render_user_message_actions(chat_id, len(chat["messages"]) - 1, display_prompt)
 
         if failed:
             st.warning(f"Couldn't extract text from: {', '.join(failed)} "
