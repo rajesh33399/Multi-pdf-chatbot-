@@ -4,6 +4,7 @@ generation, video generation, and document (PDF/ZIP/TXT) upload for RAG.
 """
 import html
 import io
+import json
 import time
 import uuid
 import zipfile
@@ -42,6 +43,10 @@ if "rename_target" not in st.session_state:
     st.session_state.rename_target = None
 if "confirm_delete_id" not in st.session_state:
     st.session_state.confirm_delete_id = None
+if "editing_index" not in st.session_state:
+    st.session_state.editing_index = {}  # {chat_id: message_index or None}
+if "regenerate_index" not in st.session_state:
+    st.session_state.regenerate_index = {}  # {chat_id: message_index or None}
 
 
 def new_chat(mode: str = "chat") -> str:
@@ -108,6 +113,66 @@ def close_assistant_media_row() -> None:
     st.markdown('</div></div>', unsafe_allow_html=True)
 
 
+def _copy_button(text: str, key: str) -> None:
+    """Small icon-only 'copy to clipboard' button. Uses the browser's
+    Clipboard API directly via a tiny inline script — no server round-trip
+    needed, so it doesn't trigger a Streamlit rerun. `text` is embedded via
+    json.dumps so quotes/newlines/backslashes/HTML-looking content can't
+    break out of the JS string literal or inject markup."""
+    safe_text = json.dumps(text)
+    st.markdown(
+        f"""
+        <button class="sparkai-icon-btn" title="Copy"
+            onclick="navigator.clipboard.writeText({safe_text});
+                     this.innerText='✓'; setTimeout(() => this.innerText='📋', 1200);">
+            📋
+        </button>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def render_user_message_actions(chat_id: str, idx: int, content: str) -> None:
+    """Copy + Edit row under a user message — mirrors Gemini's 'click a
+    message to reveal copy/edit' pattern. Edit lets you rewrite the prompt
+    and regenerate everything from that point forward. Right-aligned to
+    sit under the right-aligned user bubble above it."""
+    _spacer, col_copy, col_edit = st.columns([10, 1, 1])
+    with col_copy:
+        _copy_button(content, key=f"copyuser_{chat_id}_{idx}")
+    with col_edit:
+        if st.button("✏️", key=f"editbtn_{chat_id}_{idx}", help="Edit"):
+            st.session_state.editing_index[chat_id] = idx
+            st.rerun()
+
+
+def render_assistant_message_actions(chat_id: str, idx: int, content: str, message: dict) -> None:
+    """👍 / 👎 / copy / ⋯ row under an assistant reply, matching Gemini's
+    feedback row. Feedback is stored on the message dict and persists for
+    the session; it's cosmetic (no training pipeline behind it) but gives
+    users the same at-a-glance acknowledgement Gemini does."""
+    col_up, col_down, col_copy, col_more, _spacer = st.columns([1, 1, 1, 1, 8])
+    feedback = message.get("feedback")
+
+    with col_up:
+        if st.button("👍" if feedback != "up" else "✅", key=f"up_{chat_id}_{idx}", help="Good response"):
+            message["feedback"] = None if feedback == "up" else "up"
+            st.rerun()
+    with col_down:
+        if st.button("👎" if feedback != "down" else "❌", key=f"down_{chat_id}_{idx}", help="Bad response"):
+            message["feedback"] = None if feedback == "down" else "down"
+            st.rerun()
+    with col_copy:
+        _copy_button(content, key=f"copyassistant_{chat_id}_{idx}")
+    with col_more:
+        with st.popover("⋯", use_container_width=False):
+            if st.button("🔁 Regenerate response", key=f"regen_{chat_id}_{idx}"):
+                st.session_state.regenerate_index[chat_id] = idx
+                st.rerun()
+            if st.button("🚩 Report an issue", key=f"report_{chat_id}_{idx}"):
+                st.toast("Thanks — this has been noted.")
+
+
 # -------------------------------------------------------------------------
 # File parsing helpers
 # -------------------------------------------------------------------------
@@ -121,6 +186,17 @@ OCR_FALLBACK_THRESHOLD = 20
 # OCR render quality: 2x zoom ≈ 144 DPI, a good balance of accuracy vs
 # speed. Bump to 3 if handwriting/small text is still coming out garbled.
 OCR_ZOOM = 2
+
+# Extensions this app knows how to read. Enforced in OUR Python code
+# (see extract_text_from_bytes / extract_zip_contents) rather than via
+# st.chat_input's built-in file_type client-side filter — that filter
+# checks the browser-reported MIME type, which mobile browsers frequently
+# report as empty/generic for files picked from apps like WhatsApp,
+# Gallery, or Google Drive, causing valid .pdf/.jpg files to be rejected
+# before they ever reach this server. Filtering by extension here instead
+# means mobile uploads work the same as desktop.
+SUPPORTED_DOC_EXTENSIONS = (".pdf", ".txt", ".md", ".zip")
+SUPPORTED_IMAGE_EXTENSIONS = (".png", ".jpg", ".jpeg", ".webp")
 
 
 def _ocr_pdf(raw: bytes) -> str:
@@ -198,7 +274,7 @@ def extract_text_from_bytes(name: str, raw: bytes) -> str:
             return _extract_pdf_text(raw)
         if lower.endswith((".txt", ".md")):
             return raw.decode("utf-8", errors="ignore").strip()
-        if lower.endswith((".png", ".jpg", ".jpeg", ".webp")):
+        if lower.endswith(SUPPORTED_IMAGE_EXTENSIONS):
             # A photo/scan of notes uploaded directly (not wrapped in a
             # PDF) -> OCR it the same way.
             img = Image.open(io.BytesIO(raw)).convert("RGB")
@@ -221,7 +297,7 @@ def extract_zip_contents(raw_zip: bytes) -> tuple[list[tuple[str, str]], list[st
                     continue
                 name = info.filename
                 if not name.lower().endswith(
-                    (".pdf", ".txt", ".md", ".png", ".jpg", ".jpeg", ".webp")
+                    (".pdf", ".txt", ".md") + SUPPORTED_IMAGE_EXTENSIONS
                 ):
                     continue
                 try:
@@ -360,6 +436,32 @@ st.markdown("""
 
     #MainMenu {visibility: hidden;}
     footer {visibility: hidden;}
+
+    /* ---- Message action rows (copy/edit under user messages, feedback
+       row under assistant messages) — tight icon-only buttons instead of
+       Streamlit's default full-width button styling. ---- */
+    .sparkai-icon-btn {
+        background: transparent;
+        border: none;
+        cursor: pointer;
+        font-size: 15px;
+        padding: 2px 4px;
+        border-radius: 6px;
+        color: #5f6368;
+    }
+    .sparkai-icon-btn:hover {
+        background-color: #f0f1f3;
+    }
+    div[data-testid="column"] .stButton button {
+        padding: 2px 8px !important;
+        min-height: 1.8rem !important;
+        border: none !important;
+        background: transparent !important;
+        box-shadow: none !important;
+    }
+    div[data-testid="column"] .stButton button:hover {
+        background-color: #f0f1f3 !important;
+    }
     </style>
 """, unsafe_allow_html=True)
 
@@ -477,6 +579,49 @@ def _maybe_set_title_from_prompt(prompt: str) -> None:
         chat["title"] = (prompt[:40] + "...") if len(prompt) > 40 else prompt
 
 
+def _stream_assistant_reply(prompt: str, images=None) -> None:
+    """Streams a reply from the LLM and appends it to the current chat's
+    message list. Shared by the normal chat_input submit path AND the
+    'edit message' resend path (see the edit UI in the render loop below),
+    so both regenerate a response the exact same way. Assumes the user's
+    message has ALREADY been appended to chat["messages"] — history is
+    built from everything before it."""
+    text_history = [m for m in chat["messages"][:-1] if m.get("type", "text") == "text"]
+    response_container = st.empty()
+    full_response = ""
+    for chunk in ask_llm_stream(
+        context=chat["context"], question=prompt,
+        history=text_history, images=images,
+    ):
+        full_response += chunk
+        response_container.markdown(_build_bubble_html("assistant", full_response + "▌"), unsafe_allow_html=True)
+    response_container.markdown(_build_bubble_html("assistant", full_response), unsafe_allow_html=True)
+    chat["messages"].append({"role": "assistant", "type": "text", "content": full_response})
+
+
+chat_id = st.session_state.current_chat_id
+
+# ---- Handle a pending "regenerate response" request (from the assistant
+# message's ⋯ menu) BEFORE rendering messages, so the replaced text shows
+# immediately in the normal render loop below. Re-runs the same preceding
+# user prompt through the model and replaces the reply IN PLACE (keeps its
+# position in the conversation, clears any prior thumbs feedback on it). ----
+_regen_idx = st.session_state.regenerate_index.get(chat_id)
+if _regen_idx is not None:
+    idx = _regen_idx
+    if 0 < idx < len(chat["messages"]):
+        user_msg = chat["messages"][idx - 1]
+        if user_msg.get("type", "text") == "text" and user_msg["role"] == "user":
+            history = [m for m in chat["messages"][:idx - 1] if m.get("type", "text") == "text"]
+            with st.spinner("Regenerating..."):
+                full_response = "".join(ask_llm_stream(
+                    context=chat["context"], question=user_msg["content"], history=history,
+                ))
+            chat["messages"][idx]["content"] = full_response
+            chat["messages"][idx]["feedback"] = None
+    st.session_state.regenerate_index[chat_id] = None
+
+
 # ---- Gemini-style empty state for a brand-new, untouched chat ----
 if not chat["messages"]:
     st.markdown("""
@@ -489,10 +634,42 @@ if not chat["messages"]:
 
 
 # ---- render existing messages ----
-for message in chat["messages"]:
+editing_idx = st.session_state.editing_index.get(chat_id)
+
+for idx, message in enumerate(chat["messages"]):
     msg_type = message.get("type", "text")
+
+    if msg_type == "text" and message["role"] == "user" and idx == editing_idx:
+        # Inline edit mode for this message — Gemini-style: rewrite the
+        # prompt, then everything from here forward (this message and any
+        # replies after it) is dropped and regenerated fresh.
+        new_text = st.text_area(
+            "Edit your message", value=message["content"],
+            key=f"editarea_{chat_id}_{idx}", label_visibility="collapsed",
+        )
+        col_save, col_cancel, _spacer = st.columns([1, 1, 6])
+        with col_save:
+            if st.button("Send", key=f"editsave_{chat_id}_{idx}", type="primary"):
+                new_text = new_text.strip()
+                st.session_state.editing_index[chat_id] = None
+                if new_text:
+                    chat["messages"] = chat["messages"][:idx]
+                    _maybe_set_title_from_prompt(new_text)
+                    chat["messages"].append({"role": "user", "type": "text", "content": new_text})
+                    _stream_assistant_reply(new_text)
+                st.rerun()
+        with col_cancel:
+            if st.button("Cancel", key=f"editcancel_{chat_id}_{idx}"):
+                st.session_state.editing_index[chat_id] = None
+                st.rerun()
+        continue
+
     if msg_type == "text":
         render_message_bubble(message["role"], message["content"])
+        if message["role"] == "user":
+            render_user_message_actions(chat_id, idx, message["content"])
+        else:
+            render_assistant_message_actions(chat_id, idx, message["content"], message)
     elif msg_type == "image":
         open_assistant_media_row()
         st.image(message["data"], caption=message.get("content"))
@@ -506,18 +683,36 @@ for message in chat["messages"]:
 
 # ---- input + generation, branched by mode ----
 if mode == "chat":
+    # NOTE: no `file_type=[...]` here on purpose. st.chat_input's built-in
+    # file_type filter validates against the browser-reported MIME type,
+    # which mobile browsers (iOS Safari, Android Chrome/Samsung Internet)
+    # frequently report as empty or generic for files coming from apps
+    # like WhatsApp, Gallery, or Google Drive — that caused valid .pdf/
+    # .jpg files to be rejected client-side before ever reaching this
+    # server, even though desktop worked fine. We accept anything the
+    # picker offers and instead filter by extension ourselves below via
+    # extract_text_from_bytes / extract_zip_contents (SUPPORTED_DOC_
+    # EXTENSIONS / SUPPORTED_IMAGE_EXTENSIONS) — genuinely unsupported
+    # files still get skipped, just via our own code instead of a flaky
+    # client-side MIME check.
     submission = st.chat_input(
         "Ask SparkAI",
         accept_file="multiple",
-        file_type=["pdf", "txt", "md", "zip", "png", "jpg", "jpeg", "webp"],
     )
 
     if submission:
         prompt = (submission.text or "").strip()
         files = submission.files or []
 
-        doc_files = [f for f in files if not f.type.startswith("image/")]
-        image_files = [f for f in files if f.type.startswith("image/")]
+        # Classify by extension, not by the browser's reported MIME type
+        # (submission.files[i].type) — same reasoning as above: mobile
+        # browsers often report an empty/generic type for gallery/shared
+        # files even though the filename extension is perfectly valid.
+        def _is_image_file(f) -> bool:
+            return f.name.lower().endswith(SUPPORTED_IMAGE_EXTENSIONS)
+
+        doc_files = [f for f in files if not _is_image_file(f)]
+        image_files = [f for f in files if _is_image_file(f)]
 
         newly_attached, failed = [], []
 
@@ -535,7 +730,7 @@ if mode == "chat":
                 failed.extend(f"{f.name}/{n}" for n in zip_failures)
                 if not successes and not zip_failures:
                     failed.append(f"{f.name} (no supported files found inside)")
-            else:
+            elif f.name.lower().endswith((".pdf", ".txt", ".md")):
                 text = extract_text_from_bytes(f.name, raw)
                 if text:
                     chat["context"] = (chat["context"] + f"\n\n--- {f.name} ---\n{text}").strip()
@@ -543,16 +738,23 @@ if mode == "chat":
                     newly_attached.append(f.name)
                 else:
                     failed.append(f.name)
+            else:
+                # Extension not in our supported list at all — skip
+                # cleanly instead of silently dropping it with no feedback.
+                failed.append(f"{f.name} (unsupported file type)")
 
         # Images go straight to the model as image data (not text-extracted).
         # This only actually reaches the model on the Gemini path — see
         # llm.py's ask_llm_stream, since Groq's chat model is text-only.
         pending_images = []
         for f in image_files:
-            pending_images.append((f.read(), f.type))
-            if f.name not in chat["uploaded_files"]:
-                chat["uploaded_files"].append(f.name)
-                newly_attached.append(f.name)
+            if f.name in chat["uploaded_files"]:
+                continue
+            raw = f.read()
+            mime = f.type or "image/jpeg"  # fall back if browser omitted MIME
+            pending_images.append((raw, mime))
+            chat["uploaded_files"].append(f.name)
+            newly_attached.append(f.name)
 
         if not prompt:
             prompt = "Summarize the attached file(s) and highlight anything important."
@@ -571,19 +773,7 @@ if mode == "chat":
                        f"(likely a corrupt file, an unsupported type inside the zip, "
                        f"or OCR couldn't read the image/handwriting clearly).")
 
-        text_history = [m for m in chat["messages"][:-1] if m.get("type", "text") == "text"]
-
-        response_container = st.empty()
-        full_response = ""
-        for chunk in ask_llm_stream(
-            context=chat["context"], question=prompt,
-            history=text_history, images=pending_images or None,
-        ):
-            full_response += chunk
-            response_container.markdown(_build_bubble_html("assistant", full_response + "▌"), unsafe_allow_html=True)
-        response_container.markdown(_build_bubble_html("assistant", full_response), unsafe_allow_html=True)
-
-        chat["messages"].append({"role": "assistant", "type": "text", "content": full_response})
+        _stream_assistant_reply(prompt, images=pending_images or None)
 
 elif mode == "image":
     if prompt := st.chat_input("Describe the image you want to generate"):
