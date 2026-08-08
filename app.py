@@ -116,73 +116,88 @@ def _copy_toggle_key(key: str) -> str:
     return f"showcopy_{key}"
 
 
-def _copy_button(text: str, key: str) -> None:
-    """Copy control for a message. Uses a native type='tertiary' button
-    (Streamlit's own borderless/flat button style — no CSS needed, no
-    fighting the sanitizer) that toggles a small st.code() block into view
-    below it. st.code() has a BUILT-IN copy icon in its corner, so the
-    actual clipboard-copy is 100% native Streamlit, guaranteed to work.
-    st.popover was tried first but was dropped: unlike st.button, st.popover
-    does NOT support type='tertiary' (still an open Streamlit feature
-    request, #10416 as of this writing) so it always renders with a
-    border + dropdown chevron no CSS override could reliably remove."""
+def _render_copy_toggle(key: str) -> bool:
+    """Renders just the small copy icon button — call this inside a narrow
+    column. Returns whether the code block should be shown this run; the
+    CALLER renders st.code(...) separately, OUTSIDE the narrow column, at
+    full message width. (Rendering the code block inside the same 1/17-
+    width column it toggled from produces an unreadable one-character-
+    per-line wrap — confirmed in testing.) Uses Streamlit's native
+    ':material/content_copy:' icon — the same Material Symbols set Google
+    uses in Gemini itself — with type='tertiary' for a flat black icon,
+    no custom CSS. st.code() has a BUILT-IN copy icon in its corner, so
+    the actual clipboard-copy is 100% native Streamlit, guaranteed to
+    work. (st.popover was tried first but dropped: unlike st.button, it
+    doesn't support type='tertiary' — still an open Streamlit feature
+    request, #10416 — so it always renders with a border + chevron no
+    CSS override could reliably remove.)"""
     toggle_key = _copy_toggle_key(key)
-    if st.button("📋", key=f"copybtn_{key}", type="tertiary", help="Copy"):
+    if st.button(" ", icon=":material/content_copy:", key=f"copybtn_{key}",
+                 type="tertiary", help="Copy"):
         st.session_state[toggle_key] = not st.session_state.get(toggle_key, False)
-    if st.session_state.get(toggle_key):
-        st.code(text, language=None, wrap_lines=True)
+    return st.session_state.get(toggle_key, False)
 
 
 def render_user_message_actions(chat_id: str, idx: int, content: str) -> None:
     """Copy + Edit row under a user message — mirrors Gemini's 'click a
     message to reveal copy/edit' pattern. Edit lets you rewrite the prompt
-    and regenerate everything from that point forward. Every control here
-    is a native type='tertiary' st.button — Streamlit's own borderless
-    flat-icon style, so there's no custom CSS to fight or fall out of
-    sync with future Streamlit versions."""
+    and regenerate everything from that point forward. Every icon is a
+    native type='tertiary' st.button with a Material Symbols icon — flat
+    black line icons, matching Gemini's own icon set, no custom CSS."""
     _spacer, col_copy, col_edit = st.columns([14, 1, 1], gap="small")
     with col_copy:
-        _copy_button(content, key=f"copyuser_{chat_id}_{idx}")
+        show_copy = _render_copy_toggle(key=f"copyuser_{chat_id}_{idx}")
     with col_edit:
-        if st.button("✏️", key=f"editbtn_{chat_id}_{idx}", type="tertiary", help="Edit"):
+        if st.button(" ", icon=":material/edit:", key=f"editbtn_{chat_id}_{idx}",
+                      type="tertiary", help="Edit"):
             st.session_state.editing_index[chat_id] = idx
             st.rerun()
+    if show_copy:
+        st.code(content, language=None, wrap_lines=True)
 
 
 def render_assistant_message_actions(chat_id: str, idx: int, content: str, message: dict) -> None:
     """👍 / 👎 / copy / 🔁 / 🚩 row under an assistant reply, matching
-    Gemini's feedback row. Feedback is stored on the message dict and
-    persists for the session; it's cosmetic (no training pipeline behind
-    it) but gives users the same at-a-glance acknowledgement Gemini does.
-    Regenerate/Report were originally tucked behind a '⋯' st.popover menu
-    to match Gemini's collapsed-menu look exactly, but st.popover can't be
-    styled borderless/flat (see _copy_button's docstring) — they're shown
-    as two more flat tertiary icons instead, trading the collapsed-menu
-    look for a guaranteed-consistent flat row."""
+    Gemini's feedback row — Material Symbols icons throughout (same set
+    Gemini uses), type='tertiary' for flat black icons with no border,
+    and the selected thumb switches to type='primary' to show a filled
+    highlight (Streamlit doesn't support recoloring a Material icon on
+    its own, so a background-color swap is the native way to show
+    'selected' state). Feedback persists on the message dict for the
+    session; it's cosmetic (no training pipeline behind it). Regenerate/
+    Report were originally tucked behind a '⋯' st.popover menu to match
+    Gemini's collapsed-menu look exactly, but st.popover can't go
+    borderless/flat (see _render_copy_toggle's docstring) — shown as two
+    more flat icons instead, trading the collapsed menu for a guaranteed-
+    consistent flat row."""
     col_up, col_down, col_copy, col_regen, col_report, _spacer = st.columns(
         [1, 1, 1, 1, 1, 12], gap="small"
     )
     feedback = message.get("feedback")
 
     with col_up:
-        if st.button("👍" if feedback != "up" else "✅", key=f"up_{chat_id}_{idx}",
-                      type="tertiary", help="Good response"):
+        if st.button(" ", icon=":material/thumb_up:", key=f"up_{chat_id}_{idx}",
+                      type="primary" if feedback == "up" else "tertiary", help="Good response"):
             message["feedback"] = None if feedback == "up" else "up"
             st.rerun()
     with col_down:
-        if st.button("👎" if feedback != "down" else "❌", key=f"down_{chat_id}_{idx}",
-                      type="tertiary", help="Bad response"):
+        if st.button(" ", icon=":material/thumb_down:", key=f"down_{chat_id}_{idx}",
+                      type="primary" if feedback == "down" else "tertiary", help="Bad response"):
             message["feedback"] = None if feedback == "down" else "down"
             st.rerun()
     with col_copy:
-        _copy_button(content, key=f"copyassistant_{chat_id}_{idx}")
+        show_copy = _render_copy_toggle(key=f"copyassistant_{chat_id}_{idx}")
     with col_regen:
-        if st.button("🔁", key=f"regen_{chat_id}_{idx}", type="tertiary", help="Regenerate response"):
+        if st.button(" ", icon=":material/refresh:", key=f"regen_{chat_id}_{idx}",
+                      type="tertiary", help="Regenerate response"):
             st.session_state.regenerate_index[chat_id] = idx
             st.rerun()
     with col_report:
-        if st.button("🚩", key=f"report_{chat_id}_{idx}", type="tertiary", help="Report an issue"):
+        if st.button(" ", icon=":material/flag:", key=f"report_{chat_id}_{idx}",
+                      type="tertiary", help="Report an issue"):
             st.toast("Thanks — this has been noted.")
+    if show_copy:
+        st.code(content, language=None, wrap_lines=True)
 
 
 # -------------------------------------------------------------------------
