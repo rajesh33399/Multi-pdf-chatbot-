@@ -42,6 +42,10 @@ if "rename_target" not in st.session_state:
     st.session_state.rename_target = None
 if "confirm_delete_id" not in st.session_state:
     st.session_state.confirm_delete_id = None
+if "editing_index" not in st.session_state:
+    st.session_state.editing_index = {}  # {chat_id: message_index or None}
+if "regenerate_index" not in st.session_state:
+    st.session_state.regenerate_index = {}  # {chat_id: message_index or None}
 
 
 def new_chat(mode: str = "chat") -> str:
@@ -72,43 +76,7 @@ def switch_to(chat_id: str) -> None:
     st.session_state.confirm_delete_id = None
 
 
-def _copy_button_html(text: str) -> str:
-    """A plain HTML button with an inline onclick — real DOM, not a
-    <script> tag, so the browser wires up the click handler normally even
-    though it arrived via st.markdown(unsafe_allow_html=True). Gives a true
-    one-click clipboard copy with no Python round-trip/rerun needed. Uses
-    an inline SVG (Material Symbols' "content_copy" glyph) rather than an
-    emoji, since emoji glyph support/rendering is inconsistent across
-    fonts — this renders identically everywhere."""
-    js_safe = (
-        text.replace("\\", "\\\\").replace("'", "\\'")
-        .replace("\n", "\\n").replace("\r", "")
-    )
-    svg = (
-        '<svg xmlns="http://www.w3.org/2000/svg" height="18" viewBox="0 -960 960 960" '
-        'width="18" fill="currentColor"><path d="M360-240q-33 0-56.5-23.5T280-320v-480q0-33 '
-        '23.5-56.5T360-880h360q33 0 56.5 23.5T800-800v480q0 33-23.5 56.5T720-240H360Zm0-80h360'
-        'v-480H360v480ZM200-80q-33 0-56.5-23.5T120-160v-560h80v560h440v80H200Z"/></svg>'
-    )
-    return (
-        f'<button class="sparkai-copy-btn" title="Copy" '
-        f"onclick=\"navigator.clipboard.writeText('{js_safe}'); "
-        f"this.classList.add('copied'); setTimeout(()=>this.classList.remove('copied'), 1200);\">"
-        f"{svg}</button>"
-    )
-
-
 def _build_bubble_html(role: str, content: str) -> str:
-    """Full self-contained row+bubble in ONE markdown call — this matters:
-    Streamlit renders each st.markdown()/st.button() call as its own
-    independently-parsed HTML fragment, so any tag left "open" in one call
-    to embrace widgets from later calls just gets silently auto-closed by
-    the browser and never actually nests. Keeping the whole bubble in a
-    single call is what makes the styling (grey pill / sparkle row)
-    actually apply. The icon toolbar is rendered as a separate block right
-    below via st.columns (Streamlit's own real layout primitive) rather
-    than trying to nest it inside this div — see render_user_message /
-    render_assistant_message."""
     body_html = md_lib.markdown(html.escape(content), extensions=["sane_lists"])
     if role == "user":
         return f'<div class="sparkai-msg sparkai-user"><div class="sparkai-bubble">{body_html}</div></div>'
@@ -120,62 +88,12 @@ def _build_bubble_html(role: str, content: str) -> str:
 
 
 def render_message_bubble(role: str, content: str) -> None:
-    """Render one text message as a plain HTML bubble, no toolbar. Used for
-    the user's own message right after they hit send (before it's part of
-    persisted history) and for the live-streaming assistant placeholder."""
+    """Render one text message as a self-authored HTML bubble — right-aligned
+    grey pill for the user, left-aligned plain text with a sparkle for the
+    assistant. Content is HTML-escaped first (so a stray '<script>' typed by
+    the user, or echoed back from an uploaded document, can't execute), then
+    run through Markdown so bold/lists/links from the LLM still render."""
     st.markdown(_build_bubble_html(role, content), unsafe_allow_html=True)
-
-
-def render_user_message(message: dict) -> None:
-    """User message bubble + a compact icon row directly below it: Copy,
-    Edit. A big leading spacer column pushes the icons to hug the right
-    edge, echoing the right-aligned bubble above."""
-    mid = message.get("id", "")
-    st.markdown(_build_bubble_html("user", message["content"]), unsafe_allow_html=True)
-    _spacer, c_copy, c_edit = st.columns([0.86, 0.07, 0.07])
-    with c_copy:
-        st.markdown(_copy_button_html(message["content"]), unsafe_allow_html=True)
-    with c_edit:
-        if st.button("", key=f"edit_{mid}", help="Edit", type="tertiary", icon=":material/edit:"):
-            chat["editing_id"] = mid
-            st.rerun()
-
-
-def render_assistant_message(message: dict, idx: int) -> None:
-    """Assistant message bubble + toolbar: Copy, thumbs up/down, and a
-    '⋮' menu with Regenerate / Delete — mirrors Gemini's per-response
-    action row. A trailing spacer column keeps the icons hugging the left
-    edge, under the sparkle+bubble above."""
-    mid = message.get("id", "")
-    st.markdown(_build_bubble_html("assistant", message["content"]), unsafe_allow_html=True)
-
-    feedback = chat.setdefault("feedback", {})
-    c_copy, c_up, c_down, c_more, _spacer = st.columns([0.05, 0.05, 0.05, 0.05, 0.80])
-    with c_copy:
-        st.markdown(_copy_button_html(message["content"]), unsafe_allow_html=True)
-    with c_up:
-        liked = feedback.get(mid) == "up"
-        if st.button("", key=f"up_{mid}", help="Good response", type="tertiary",
-                     icon=":material/thumb_up:" if not liked else ":material/check:"):
-            feedback[mid] = "up"
-            st.toast("Thanks for the feedback! 👍")
-    with c_down:
-        disliked = feedback.get(mid) == "down"
-        if st.button("", key=f"down_{mid}", help="Bad response", type="tertiary",
-                     icon=":material/thumb_down:" if not disliked else ":material/check:"):
-            feedback[mid] = "down"
-            st.toast("Thanks for the feedback — noted. 👎")
-    with c_more:
-        with st.popover("", icon=":material/more_vert:", use_container_width=False):
-            if st.button("Regenerate", key=f"regen_{mid}", icon=":material/refresh:", use_container_width=True):
-                prev = chat["messages"][idx - 1] if idx > 0 else None
-                if prev and prev.get("type", "text") == "text" and prev["role"] == "user":
-                    chat["messages"] = chat["messages"][:idx]
-                    chat["pending_regen"] = prev["content"]
-                st.rerun()
-            if st.button("Delete", key=f"del_{mid}", icon=":material/delete:", use_container_width=True):
-                del chat["messages"][idx]
-                st.rerun()
 
 
 def open_assistant_media_row() -> None:
@@ -194,6 +112,79 @@ def close_assistant_media_row() -> None:
     st.markdown('</div></div>', unsafe_allow_html=True)
 
 
+def _copy_toggle_key(key: str) -> str:
+    return f"showcopy_{key}"
+
+
+def _copy_button(text: str, key: str) -> None:
+    """Copy control for a message. Uses a native type='tertiary' button
+    (Streamlit's own borderless/flat button style — no CSS needed, no
+    fighting the sanitizer) that toggles a small st.code() block into view
+    below it. st.code() has a BUILT-IN copy icon in its corner, so the
+    actual clipboard-copy is 100% native Streamlit, guaranteed to work.
+    st.popover was tried first but was dropped: unlike st.button, st.popover
+    does NOT support type='tertiary' (still an open Streamlit feature
+    request, #10416 as of this writing) so it always renders with a
+    border + dropdown chevron no CSS override could reliably remove."""
+    toggle_key = _copy_toggle_key(key)
+    if st.button("📋", key=f"copybtn_{key}", type="tertiary", help="Copy"):
+        st.session_state[toggle_key] = not st.session_state.get(toggle_key, False)
+    if st.session_state.get(toggle_key):
+        st.code(text, language=None, wrap_lines=True)
+
+
+def render_user_message_actions(chat_id: str, idx: int, content: str) -> None:
+    """Copy + Edit row under a user message — mirrors Gemini's 'click a
+    message to reveal copy/edit' pattern. Edit lets you rewrite the prompt
+    and regenerate everything from that point forward. Every control here
+    is a native type='tertiary' st.button — Streamlit's own borderless
+    flat-icon style, so there's no custom CSS to fight or fall out of
+    sync with future Streamlit versions."""
+    _spacer, col_copy, col_edit = st.columns([14, 1, 1], gap="small")
+    with col_copy:
+        _copy_button(content, key=f"copyuser_{chat_id}_{idx}")
+    with col_edit:
+        if st.button("✏️", key=f"editbtn_{chat_id}_{idx}", type="tertiary", help="Edit"):
+            st.session_state.editing_index[chat_id] = idx
+            st.rerun()
+
+
+def render_assistant_message_actions(chat_id: str, idx: int, content: str, message: dict) -> None:
+    """👍 / 👎 / copy / 🔁 / 🚩 row under an assistant reply, matching
+    Gemini's feedback row. Feedback is stored on the message dict and
+    persists for the session; it's cosmetic (no training pipeline behind
+    it) but gives users the same at-a-glance acknowledgement Gemini does.
+    Regenerate/Report were originally tucked behind a '⋯' st.popover menu
+    to match Gemini's collapsed-menu look exactly, but st.popover can't be
+    styled borderless/flat (see _copy_button's docstring) — they're shown
+    as two more flat tertiary icons instead, trading the collapsed-menu
+    look for a guaranteed-consistent flat row."""
+    col_up, col_down, col_copy, col_regen, col_report, _spacer = st.columns(
+        [1, 1, 1, 1, 1, 12], gap="small"
+    )
+    feedback = message.get("feedback")
+
+    with col_up:
+        if st.button("👍" if feedback != "up" else "✅", key=f"up_{chat_id}_{idx}",
+                      type="tertiary", help="Good response"):
+            message["feedback"] = None if feedback == "up" else "up"
+            st.rerun()
+    with col_down:
+        if st.button("👎" if feedback != "down" else "❌", key=f"down_{chat_id}_{idx}",
+                      type="tertiary", help="Bad response"):
+            message["feedback"] = None if feedback == "down" else "down"
+            st.rerun()
+    with col_copy:
+        _copy_button(content, key=f"copyassistant_{chat_id}_{idx}")
+    with col_regen:
+        if st.button("🔁", key=f"regen_{chat_id}_{idx}", type="tertiary", help="Regenerate response"):
+            st.session_state.regenerate_index[chat_id] = idx
+            st.rerun()
+    with col_report:
+        if st.button("🚩", key=f"report_{chat_id}_{idx}", type="tertiary", help="Report an issue"):
+            st.toast("Thanks — this has been noted.")
+
+
 # -------------------------------------------------------------------------
 # File parsing helpers
 # -------------------------------------------------------------------------
@@ -207,6 +198,17 @@ OCR_FALLBACK_THRESHOLD = 20
 # OCR render quality: 2x zoom ≈ 144 DPI, a good balance of accuracy vs
 # speed. Bump to 3 if handwriting/small text is still coming out garbled.
 OCR_ZOOM = 2
+
+# Extensions this app knows how to read. Enforced in OUR Python code
+# (see extract_text_from_bytes / extract_zip_contents) rather than via
+# st.chat_input's built-in file_type client-side filter — that filter
+# checks the browser-reported MIME type, which mobile browsers frequently
+# report as empty/generic for files picked from apps like WhatsApp,
+# Gallery, or Google Drive, causing valid .pdf/.jpg files to be rejected
+# before they ever reach this server. Filtering by extension here instead
+# means mobile uploads work the same as desktop.
+SUPPORTED_DOC_EXTENSIONS = (".pdf", ".txt", ".md", ".zip")
+SUPPORTED_IMAGE_EXTENSIONS = (".png", ".jpg", ".jpeg", ".webp")
 
 
 def _ocr_pdf(raw: bytes) -> str:
@@ -284,7 +286,7 @@ def extract_text_from_bytes(name: str, raw: bytes) -> str:
             return _extract_pdf_text(raw)
         if lower.endswith((".txt", ".md")):
             return raw.decode("utf-8", errors="ignore").strip()
-        if lower.endswith((".png", ".jpg", ".jpeg", ".webp")):
+        if lower.endswith(SUPPORTED_IMAGE_EXTENSIONS):
             # A photo/scan of notes uploaded directly (not wrapped in a
             # PDF) -> OCR it the same way.
             img = Image.open(io.BytesIO(raw)).convert("RGB")
@@ -307,7 +309,7 @@ def extract_zip_contents(raw_zip: bytes) -> tuple[list[tuple[str, str]], list[st
                     continue
                 name = info.filename
                 if not name.lower().endswith(
-                    (".pdf", ".txt", ".md", ".png", ".jpg", ".jpeg", ".webp")
+                    (".pdf", ".txt", ".md") + SUPPORTED_IMAGE_EXTENSIONS
                 ):
                     continue
                 try:
@@ -427,33 +429,6 @@ st.markdown("""
     .sparkai-bubble p:first-child { margin-top: 0; }
     .sparkai-bubble p:last-child { margin-bottom: 0; }
     .sparkai-bubble ol, .sparkai-bubble ul { margin: 6px 0; padding-left: 22px; }
-
-    /* ---- Copy button (raw HTML, not a Streamlit widget — see
-       _copy_button_html in app.py). Plain class selector, so this is safe
-       regardless of exactly where in the DOM the button ends up. ---- */
-    .sparkai-copy-btn {
-        background: transparent;
-        border: none;
-        color: #5f6368;
-        padding: 6px;
-        margin-top: 2px;
-        border-radius: 50%;
-        cursor: pointer;
-        display: inline-flex;
-        align-items: center;
-        justify-content: center;
-    }
-    .sparkai-copy-btn:hover { background-color: #e8eaed; }
-    .sparkai-copy-btn.copied { color: #1a73e8; }
-
-    /* Pull the icon-row (st.columns, rendered right after each bubble)
-       up closer to the bubble above it — Streamlit adds some vertical
-       gap between blocks by default that looks too loose for a compact
-       message action row. */
-    .sparkai-msg + div[data-testid="stHorizontalBlock"] {
-        margin-top: -10px;
-        margin-bottom: 4px;
-    }
 
     /* ---- Reskin the chat_input's built-in attach control to a plain
        "+" instead of the default paperclip, to match Gemini. This targets
@@ -590,6 +565,49 @@ def _maybe_set_title_from_prompt(prompt: str) -> None:
         chat["title"] = (prompt[:40] + "...") if len(prompt) > 40 else prompt
 
 
+def _stream_assistant_reply(prompt: str, images=None) -> None:
+    """Streams a reply from the LLM and appends it to the current chat's
+    message list. Shared by the normal chat_input submit path AND the
+    'edit message' resend path (see the edit UI in the render loop below),
+    so both regenerate a response the exact same way. Assumes the user's
+    message has ALREADY been appended to chat["messages"] — history is
+    built from everything before it."""
+    text_history = [m for m in chat["messages"][:-1] if m.get("type", "text") == "text"]
+    response_container = st.empty()
+    full_response = ""
+    for chunk in ask_llm_stream(
+        context=chat["context"], question=prompt,
+        history=text_history, images=images,
+    ):
+        full_response += chunk
+        response_container.markdown(_build_bubble_html("assistant", full_response + "▌"), unsafe_allow_html=True)
+    response_container.markdown(_build_bubble_html("assistant", full_response), unsafe_allow_html=True)
+    chat["messages"].append({"role": "assistant", "type": "text", "content": full_response})
+
+
+chat_id = st.session_state.current_chat_id
+
+# ---- Handle a pending "regenerate response" request (from the assistant
+# message's ⋯ menu) BEFORE rendering messages, so the replaced text shows
+# immediately in the normal render loop below. Re-runs the same preceding
+# user prompt through the model and replaces the reply IN PLACE (keeps its
+# position in the conversation, clears any prior thumbs feedback on it). ----
+_regen_idx = st.session_state.regenerate_index.get(chat_id)
+if _regen_idx is not None:
+    idx = _regen_idx
+    if 0 < idx < len(chat["messages"]):
+        user_msg = chat["messages"][idx - 1]
+        if user_msg.get("type", "text") == "text" and user_msg["role"] == "user":
+            history = [m for m in chat["messages"][:idx - 1] if m.get("type", "text") == "text"]
+            with st.spinner("Regenerating..."):
+                full_response = "".join(ask_llm_stream(
+                    context=chat["context"], question=user_msg["content"], history=history,
+                ))
+            chat["messages"][idx]["content"] = full_response
+            chat["messages"][idx]["feedback"] = None
+    st.session_state.regenerate_index[chat_id] = None
+
+
 # ---- Gemini-style empty state for a brand-new, untouched chat ----
 if not chat["messages"]:
     st.markdown("""
@@ -602,43 +620,42 @@ if not chat["messages"]:
 
 
 # ---- render existing messages ----
-chat.setdefault("editing_id", None)
-chat.setdefault("pending_prompt", None)
-chat.setdefault("pending_regen", None)
-chat.setdefault("feedback", {})
+editing_idx = st.session_state.editing_index.get(chat_id)
 
 for idx, message in enumerate(chat["messages"]):
     msg_type = message.get("type", "text")
-    mid = message.get("id") or f"noid_{idx}"
-    message["id"] = mid
 
-    if msg_type == "text" and message["role"] == "user" and chat["editing_id"] == mid:
-        # ---- Edit mode: swap the bubble for an editable text area ----
-        edited = st.text_area(
-            "Edit message", value=message["content"], key=f"edit_area_{mid}",
-            label_visibility="collapsed",
+    if msg_type == "text" and message["role"] == "user" and idx == editing_idx:
+        # Inline edit mode for this message — Gemini-style: rewrite the
+        # prompt, then everything from here forward (this message and any
+        # replies after it) is dropped and regenerated fresh.
+        new_text = st.text_area(
+            "Edit your message", value=message["content"],
+            key=f"editarea_{chat_id}_{idx}", label_visibility="collapsed",
         )
-        col_save, col_cancel = st.columns(2)
+        col_save, col_cancel, _spacer = st.columns([1, 1, 6])
         with col_save:
-            if st.button("Save & regenerate", key=f"save_edit_{mid}", use_container_width=True):
-                # Truncate everything from this message onward — the edited
-                # question gets resubmitted fresh, same as Gemini's
-                # edit-and-regenerate flow.
-                chat["messages"] = chat["messages"][:idx]
-                chat["editing_id"] = None
-                chat["pending_prompt"] = edited.strip()
+            if st.button("Send", key=f"editsave_{chat_id}_{idx}", type="primary"):
+                new_text = new_text.strip()
+                st.session_state.editing_index[chat_id] = None
+                if new_text:
+                    chat["messages"] = chat["messages"][:idx]
+                    _maybe_set_title_from_prompt(new_text)
+                    chat["messages"].append({"role": "user", "type": "text", "content": new_text})
+                    _stream_assistant_reply(new_text)
                 st.rerun()
         with col_cancel:
-            if st.button("Cancel", key=f"cancel_edit_{mid}", use_container_width=True):
-                chat["editing_id"] = None
+            if st.button("Cancel", key=f"editcancel_{chat_id}_{idx}"):
+                st.session_state.editing_index[chat_id] = None
                 st.rerun()
         continue
 
     if msg_type == "text":
+        render_message_bubble(message["role"], message["content"])
         if message["role"] == "user":
-            render_user_message(message)
+            render_user_message_actions(chat_id, idx, message["content"])
         else:
-            render_assistant_message(message, idx)
+            render_assistant_message_actions(chat_id, idx, message["content"], message)
     elif msg_type == "image":
         open_assistant_media_row()
         st.image(message["data"], caption=message.get("content"))
@@ -652,73 +669,36 @@ for idx, message in enumerate(chat["messages"]):
 
 # ---- input + generation, branched by mode ----
 if mode == "chat":
-
-    def _generate_assistant_reply(question: str, failed: list[str] | None = None,
-                                   pending_images: list[tuple[bytes, str]] | None = None) -> None:
-        """Streams a reply for `question` and appends it. Assumes the
-        question this answers is already the LAST message in
-        chat['messages'] (true both for a normal new turn and for
-        regenerate, where history was truncated right up to that question)."""
-        if failed:
-            st.warning(f"Couldn't extract text from: {', '.join(failed)} "
-                       f"(likely a corrupt file, an unsupported type inside the zip, "
-                       f"or OCR couldn't read the image/handwriting clearly).")
-
-        text_history = [m for m in chat["messages"][:-1] if m.get("type", "text") == "text"]
-
-        response_container = st.empty()
-        full_response = ""
-        for chunk in ask_llm_stream(
-            context=chat["context"], question=question,
-            history=text_history, images=pending_images or None,
-        ):
-            full_response += chunk
-            response_container.markdown(_build_bubble_html("assistant", full_response + "▌"), unsafe_allow_html=True)
-        response_container.markdown(_build_bubble_html("assistant", full_response), unsafe_allow_html=True)
-
-        chat["messages"].append({
-            "id": str(uuid.uuid4()), "role": "assistant", "type": "text", "content": full_response,
-        })
-
-    def _process_user_turn(prompt: str, newly_attached: list[str] | None = None,
-                            failed: list[str] | None = None,
-                            pending_images: list[tuple[bytes, str]] | None = None) -> None:
-        newly_attached = newly_attached or []
-        _maybe_set_title_from_prompt(prompt)
-        display_prompt = prompt
-        if newly_attached:
-            display_prompt += "\n\n📎 " + ", ".join(newly_attached)
-        chat["messages"].append({
-            "id": str(uuid.uuid4()), "role": "user", "type": "text", "content": display_prompt,
-        })
-        render_message_bubble("user", display_prompt)
-        for img_bytes, _mime in (pending_images or []):
-            st.image(img_bytes, width=220)
-        _generate_assistant_reply(prompt, failed=failed, pending_images=pending_images)
-
-    # A regenerate or an edit-save truncates history and leaves a flag for
-    # us to pick up here, on the run right after — see render_assistant_message
-    # (Regenerate) and the edit-mode block above (Save & regenerate).
-    pending_regen = chat.pop("pending_regen", None)
-    if pending_regen:
-        _generate_assistant_reply(pending_regen)
-
-    pending_prompt = chat.pop("pending_prompt", None)
-    if pending_prompt:
-        _process_user_turn(pending_prompt)
-
+    # NOTE: no `file_type=[...]` here on purpose. st.chat_input's built-in
+    # file_type filter validates against the browser-reported MIME type,
+    # which mobile browsers (iOS Safari, Android Chrome/Samsung Internet)
+    # frequently report as empty or generic for files coming from apps
+    # like WhatsApp, Gallery, or Google Drive — that caused valid .pdf/
+    # .jpg files to be rejected client-side before ever reaching this
+    # server, even though desktop worked fine. We accept anything the
+    # picker offers and instead filter by extension ourselves below via
+    # extract_text_from_bytes / extract_zip_contents (SUPPORTED_DOC_
+    # EXTENSIONS / SUPPORTED_IMAGE_EXTENSIONS) — genuinely unsupported
+    # files still get skipped, just via our own code instead of a flaky
+    # client-side MIME check.
     submission = st.chat_input(
         "Ask SparkAI",
         accept_file="multiple",
-        file_type=["pdf", "txt", "md", "zip", "png", "jpg", "jpeg", "webp"],
     )
 
     if submission:
         prompt = (submission.text or "").strip()
         files = submission.files or []
 
-        doc_files = [f for f in files if not f.type.startswith("image/")]
-        image_files = [f for f in files if f.type.startswith("image/")]
+        # Classify by extension, not by the browser's reported MIME type
+        # (submission.files[i].type) — same reasoning as above: mobile
+        # browsers often report an empty/generic type for gallery/shared
+        # files even though the filename extension is perfectly valid.
+        def _is_image_file(f) -> bool:
+            return f.name.lower().endswith(SUPPORTED_IMAGE_EXTENSIONS)
+
+        doc_files = [f for f in files if not _is_image_file(f)]
+        image_files = [f for f in files if _is_image_file(f)]
 
         newly_attached, failed = [], []
 
@@ -736,7 +716,7 @@ if mode == "chat":
                 failed.extend(f"{f.name}/{n}" for n in zip_failures)
                 if not successes and not zip_failures:
                     failed.append(f"{f.name} (no supported files found inside)")
-            else:
+            elif f.name.lower().endswith((".pdf", ".txt", ".md")):
                 text = extract_text_from_bytes(f.name, raw)
                 if text:
                     chat["context"] = (chat["context"] + f"\n\n--- {f.name} ---\n{text}").strip()
@@ -744,21 +724,42 @@ if mode == "chat":
                     newly_attached.append(f.name)
                 else:
                     failed.append(f.name)
+            else:
+                # Extension not in our supported list at all — skip
+                # cleanly instead of silently dropping it with no feedback.
+                failed.append(f"{f.name} (unsupported file type)")
 
         # Images go straight to the model as image data (not text-extracted).
         # This only actually reaches the model on the Gemini path — see
         # llm.py's ask_llm_stream, since Groq's chat model is text-only.
         pending_images = []
         for f in image_files:
-            pending_images.append((f.read(), f.type))
-            if f.name not in chat["uploaded_files"]:
-                chat["uploaded_files"].append(f.name)
-                newly_attached.append(f.name)
+            if f.name in chat["uploaded_files"]:
+                continue
+            raw = f.read()
+            mime = f.type or "image/jpeg"  # fall back if browser omitted MIME
+            pending_images.append((raw, mime))
+            chat["uploaded_files"].append(f.name)
+            newly_attached.append(f.name)
 
         if not prompt:
             prompt = "Summarize the attached file(s) and highlight anything important."
 
-        _process_user_turn(prompt, newly_attached=newly_attached, failed=failed, pending_images=pending_images)
+        _maybe_set_title_from_prompt(prompt)
+        display_prompt = prompt
+        if newly_attached:
+            display_prompt += "\n\n📎 " + ", ".join(newly_attached)
+        chat["messages"].append({"role": "user", "type": "text", "content": display_prompt})
+        render_message_bubble("user", display_prompt)
+        for img_bytes, _mime in pending_images:
+            st.image(img_bytes, width=220)
+
+        if failed:
+            st.warning(f"Couldn't extract text from: {', '.join(failed)} "
+                       f"(likely a corrupt file, an unsupported type inside the zip, "
+                       f"or OCR couldn't read the image/handwriting clearly).")
+
+        _stream_assistant_reply(prompt, images=pending_images or None)
 
 elif mode == "image":
     if prompt := st.chat_input("Describe the image you want to generate"):
