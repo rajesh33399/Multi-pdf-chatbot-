@@ -13,3 +13,4 @@ Pillow
 huggingface_hub
 torch
 torchvision
+transformers
