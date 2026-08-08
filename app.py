@@ -50,6 +50,21 @@ if "regenerate_index" not in st.session_state:
     st.session_state.regenerate_index = {}  # {chat_id: message_index or None}
 
 
+def _branch_chat(source_chat_id: str, up_to_idx: int) -> None:
+    """Gemini's 'Branch in new chat': copies everything up to and including
+    this message into a brand new chat and switches to it, leaving the
+    original conversation untouched — lets you explore a different
+    direction from this point without losing the original thread."""
+    source = st.session_state.chats[source_chat_id]
+    new_id = new_chat(source["mode"])  # also switches current_chat_id
+    st.session_state.chats[new_id]["messages"] = [
+        dict(m) for m in source["messages"][: up_to_idx + 1]
+    ]
+    st.session_state.chats[new_id]["context"] = source["context"]
+    st.session_state.chats[new_id]["uploaded_files"] = list(source["uploaded_files"])
+    st.session_state.chats[new_id]["title"] = (source["title"] or "Chat") + " (branch)"
+
+
 def new_chat(mode: str = "chat") -> str:
     chat_id = str(uuid.uuid4())
     st.session_state.chats[chat_id] = {
@@ -238,9 +253,23 @@ def render_assistant_message_actions(chat_id: str, idx: int, content: str, messa
     with col_more:
         with st.popover(" ", icon=":material/more_vert:", type="tertiary",
                          use_container_width=False, help="More"):
-            if st.button("Report an issue", icon=":material/flag:",
-                         key=f"report_{chat_id}_{idx}", type="tertiary",
-                         use_container_width=True):
+            if st.button("Branch in new chat", icon=":material/call_split:",
+                         key=f"branch_{chat_id}_{idx}", use_container_width=True):
+                _branch_chat(chat_id, idx)
+                st.rerun()
+            if st.button("Listen", icon=":material/volume_up:",
+                         key=f"listen_{chat_id}_{idx}", use_container_width=True):
+                # Real text-to-speech via the browser's built-in Web Speech
+                # API — no external TTS service/API key needed, and it's
+                # instant since it's entirely client-side.
+                safe_text = json.dumps(content)
+                components.html(
+                    f"<script>window.speechSynthesis.cancel();"
+                    f"window.speechSynthesis.speak(new SpeechSynthesisUtterance({safe_text}));</script>",
+                    height=0,
+                )
+            if st.button("Report legal issue", icon=":material/flag:",
+                         key=f"report_{chat_id}_{idx}", use_container_width=True):
                 st.toast("Thanks — this has been noted.")
 
     # "What went wrong?" reason card — Gemini's actual bad-response flow,
