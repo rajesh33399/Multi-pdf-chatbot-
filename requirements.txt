@@ -11,3 +11,5 @@ sentence-transformers
 pymupdf
 Pillow
 huggingface_hub
+torch
+torchvision
