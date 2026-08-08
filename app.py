@@ -4,7 +4,6 @@ generation, video generation, and document (PDF/ZIP/TXT) upload for RAG.
 """
 import html
 import io
-import json
 import time
 import uuid
 import zipfile
@@ -114,22 +113,18 @@ def close_assistant_media_row() -> None:
 
 
 def _copy_button(text: str, key: str) -> None:
-    """Small icon-only 'copy to clipboard' button. Uses the browser's
-    Clipboard API directly via a tiny inline script — no server round-trip
-    needed, so it doesn't trigger a Streamlit rerun. `text` is embedded via
-    json.dumps so quotes/newlines/backslashes/HTML-looking content can't
-    break out of the JS string literal or inject markup."""
-    safe_text = json.dumps(text)
-    st.markdown(
-        f"""
-        <button class="sparkai-icon-btn" title="Copy"
-            onclick="navigator.clipboard.writeText({safe_text});
-                     this.innerText='✓'; setTimeout(() => this.innerText='📋', 1200);">
-            📋
-        </button>
-        """,
-        unsafe_allow_html=True,
-    )
+    """Copy control for a message. Streamlit's st.markdown(unsafe_allow_html
+    =True) does NOT reliably run inline onclick JS (confirmed Streamlit
+    issue #10430) and mangles multi-line HTML strings, printing them as
+    literal text instead of rendering (confirmed issue #859) — that's
+    exactly the raw-HTML-as-text bug seen in testing. Rather than fight
+    Streamlit's HTML sanitizer, this uses st.code()'s BUILT-IN copy icon
+    (the small clipboard glyph that appears on hover in the corner of any
+    code block) — a native Streamlit feature that's guaranteed to work,
+    at the cost of one extra click (open the popover, then click the
+    icon on the code block) versus a single custom button."""
+    with st.popover("📋", use_container_width=False):
+        st.code(text, language=None, wrap_lines=True)
 
 
 def render_user_message_actions(chat_id: str, idx: int, content: str) -> None:
@@ -440,26 +435,16 @@ st.markdown("""
     /* ---- Message action rows (copy/edit under user messages, feedback
        row under assistant messages) — tight icon-only buttons instead of
        Streamlit's default full-width button styling. ---- */
-    .sparkai-icon-btn {
-        background: transparent;
-        border: none;
-        cursor: pointer;
-        font-size: 15px;
-        padding: 2px 4px;
-        border-radius: 6px;
-        color: #5f6368;
-    }
-    .sparkai-icon-btn:hover {
-        background-color: #f0f1f3;
-    }
-    div[data-testid="column"] .stButton button {
+    div[data-testid="column"] .stButton button,
+    div[data-testid="column"] [data-testid="stPopover"] button {
         padding: 2px 8px !important;
         min-height: 1.8rem !important;
         border: none !important;
         background: transparent !important;
         box-shadow: none !important;
     }
-    div[data-testid="column"] .stButton button:hover {
+    div[data-testid="column"] .stButton button:hover,
+    div[data-testid="column"] [data-testid="stPopover"] button:hover {
         background-color: #f0f1f3 !important;
     }
     </style>
