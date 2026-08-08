@@ -131,14 +131,19 @@ def render_user_message_actions(chat_id: str, idx: int, content: str) -> None:
     """Copy + Edit row under a user message — mirrors Gemini's 'click a
     message to reveal copy/edit' pattern. Edit lets you rewrite the prompt
     and regenerate everything from that point forward. Right-aligned to
-    sit under the right-aligned user bubble above it."""
-    _spacer, col_copy, col_edit = st.columns([10, 1, 1])
+    sit under the right-aligned user bubble above it. Wrapped in a
+    '.sparkai-actions' div (see CSS block) so the flat, borderless icon
+    styling applies ONLY to this row — not to every button/popover
+    elsewhere in the app (sidebar menus, etc.)."""
+    st.markdown('<div class="sparkai-actions sparkai-actions-right">', unsafe_allow_html=True)
+    _spacer, col_copy, col_edit = st.columns([14, 1, 1], gap="small")
     with col_copy:
         _copy_button(content, key=f"copyuser_{chat_id}_{idx}")
     with col_edit:
         if st.button("✏️", key=f"editbtn_{chat_id}_{idx}", help="Edit"):
             st.session_state.editing_index[chat_id] = idx
             st.rerun()
+    st.markdown('</div>', unsafe_allow_html=True)
 
 
 def render_assistant_message_actions(chat_id: str, idx: int, content: str, message: dict) -> None:
@@ -146,7 +151,8 @@ def render_assistant_message_actions(chat_id: str, idx: int, content: str, messa
     feedback row. Feedback is stored on the message dict and persists for
     the session; it's cosmetic (no training pipeline behind it) but gives
     users the same at-a-glance acknowledgement Gemini does."""
-    col_up, col_down, col_copy, col_more, _spacer = st.columns([1, 1, 1, 1, 8])
+    st.markdown('<div class="sparkai-actions sparkai-actions-left">', unsafe_allow_html=True)
+    col_up, col_down, col_copy, col_more, _spacer = st.columns([1, 1, 1, 1, 14], gap="small")
     feedback = message.get("feedback")
 
     with col_up:
@@ -166,6 +172,7 @@ def render_assistant_message_actions(chat_id: str, idx: int, content: str, messa
                 st.rerun()
             if st.button("🚩 Report an issue", key=f"report_{chat_id}_{idx}"):
                 st.toast("Thanks — this has been noted.")
+    st.markdown('</div>', unsafe_allow_html=True)
 
 
 # -------------------------------------------------------------------------
@@ -433,19 +440,43 @@ st.markdown("""
     footer {visibility: hidden;}
 
     /* ---- Message action rows (copy/edit under user messages, feedback
-       row under assistant messages) — tight icon-only buttons instead of
-       Streamlit's default full-width button styling. ---- */
-    div[data-testid="column"] .stButton button,
-    div[data-testid="column"] [data-testid="stPopover"] button {
-        padding: 2px 8px !important;
-        min-height: 1.8rem !important;
+       row under assistant messages) — scoped to .sparkai-actions so this
+       flat, borderless icon styling applies ONLY here, not to every
+       button/popover elsewhere in the app (sidebar menus, etc). Targets
+       BOTH the older ".stButton button" class selector and the current
+       "[data-testid^='stBaseButton']" attribute selector (Streamlit
+       renamed button testids across versions), so this keeps working
+       whichever one the deployed Streamlit version actually renders. ---- */
+    .sparkai-actions {
+        margin-top: -6px;
+        margin-bottom: 4px;
+    }
+    .sparkai-actions [data-testid="column"] {
+        display: flex;
+        align-items: center;
+    }
+    .sparkai-actions button,
+    .sparkai-actions [data-testid^="stBaseButton"] {
+        padding: 2px 6px !important;
+        min-height: 1.6rem !important;
+        min-width: 0 !important;
         border: none !important;
         background: transparent !important;
         box-shadow: none !important;
+        font-size: 14px !important;
+        line-height: 1.2 !important;
     }
-    div[data-testid="column"] .stButton button:hover,
-    div[data-testid="column"] [data-testid="stPopover"] button:hover {
+    .sparkai-actions button:hover,
+    .sparkai-actions [data-testid^="stBaseButton"]:hover {
         background-color: #f0f1f3 !important;
+        border: none !important;
+    }
+    /* Hide the dropdown-chevron icon Streamlit renders on popover trigger
+       buttons — for a copy icon or "⋯" menu we want a plain flat icon,
+       not a visible dropdown affordance. Only removes the trailing arrow
+       svg; the emoji label itself is text, not svg, so it's unaffected. */
+    .sparkai-actions [data-testid="stPopover"] button svg {
+        display: none !important;
     }
     </style>
 """, unsafe_allow_html=True)
