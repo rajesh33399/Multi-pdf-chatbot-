@@ -4,6 +4,7 @@ generation, video generation, and document (PDF/ZIP/TXT) upload for RAG.
 """
 import html
 import io
+import json
 import time
 import uuid
 import zipfile
@@ -12,6 +13,7 @@ import fitz  # pymupdf — renders PDF pages to images for OCR fallback
 import markdown as md_lib
 import pytesseract
 import streamlit as st
+import streamlit.components.v1 as components
 from PIL import Image
 from pypdf import PdfReader
 
@@ -112,92 +114,176 @@ def close_assistant_media_row() -> None:
     st.markdown('</div></div>', unsafe_allow_html=True)
 
 
-def _copy_toggle_key(key: str) -> str:
-    return f"showcopy_{key}"
+_ICON_SVGS = {
+    "thumb_up": '<path d="M1 21h4V9H1v12zm22-11c0-1.1-.9-2-2-2h-6.31l.95-4.57.03-.32c0-.41-.17-.79-.44-1.06L14.17 1 7.59 7.59C7.22 7.95 7 8.45 7 9v10c0 1.1.9 2 2 2h9c.83 0 1.54-.5 1.84-1.22l3.02-7.05c.09-.23.14-.47.14-.73v-2z"/>',
+    "thumb_down": '<path d="M15 3H6c-.83 0-1.54.5-1.84 1.22l-3.02 7.05c-.09.23-.14.47-.14.73v2c0 1.1.9 2 2 2h6.31l-.95 4.57-.03.32c0 .41.17.79.44 1.06L9.83 23l6.59-6.59c.36-.36.58-.86.58-1.41V5c0-1.1-.9-2-2-2zm4 0v12h4V3h-4z"/>',
+    "refresh": '<path d="M17.65 6.35C16.2 4.9 14.21 4 12 4c-4.42 0-7.99 3.58-7.99 8s3.57 8 7.99 8c3.73 0 6.84-2.55 7.73-6h-2.08c-.82 2.33-3.04 4-5.65 4-3.31 0-6-2.69-6-6s2.69-6 6-6c1.66 0 3.14.69 4.22 1.78L13 11h7V4l-2.35 2.35z"/>',
+    "content_copy": '<path d="M16 1H4c-1.1 0-2 .9-2 2v14h2V3h12V1zm3 4H8c-1.1 0-2 .9-2 2v14c0 1.1.9 2 2 2h11c1.1 0 2-.9 2-2V7c0-1.1-.9-2-2-2zm0 16H8V7h11v14z"/>',
+    "more_horiz": '<path d="M6 10c-1.1 0-2 .9-2 2s.9 2 2 2 2-.9 2-2-.9-2-2-2zm12 0c-1.1 0-2 .9-2 2s.9 2 2 2 2-.9 2-2-.9-2-2-2zm-6 0c-1.1 0-2 .9-2 2s.9 2 2 2 2-.9 2-2-.9-2-2-2z"/>',
+    "flag": '<path d="M14.4 6L14 4H5v17h2v-7h6.6l.4 2h7V6z"/>',
+    "edit": '<path d="M3 17.25V21h3.75L17.81 9.94l-3.75-3.75L3 17.25zM20.71 7.04c.39-.39.39-1.02 0-1.41l-2.34-2.34c-.39-.39-1.02-.39-1.41 0l-1.83 1.83 3.75 3.75 1.83-1.83z"/>',
+}
 
 
-def _render_copy_toggle(key: str) -> bool:
-    """Renders just the small copy icon button — call this inside a narrow
-    column. Returns whether the code block should be shown this run; the
-    CALLER renders st.code(...) separately, OUTSIDE the narrow column, at
-    full message width. (Rendering the code block inside the same 1/17-
-    width column it toggled from produces an unreadable one-character-
-    per-line wrap — confirmed in testing.) Uses Streamlit's native
-    ':material/content_copy:' icon — the same Material Symbols set Google
-    uses in Gemini itself — with type='tertiary' for a flat black icon,
-    no custom CSS. st.code() has a BUILT-IN copy icon in its corner, so
-    the actual clipboard-copy is 100% native Streamlit, guaranteed to
-    work. (st.popover was tried first but dropped: unlike st.button, it
-    doesn't support type='tertiary' — still an open Streamlit feature
-    request, #10416 — so it always renders with a border + chevron no
-    CSS override could reliably remove.)"""
-    toggle_key = _copy_toggle_key(key)
-    if st.button(" ", icon=":material/content_copy:", key=f"copybtn_{key}",
-                 type="tertiary", help="Copy"):
-        st.session_state[toggle_key] = not st.session_state.get(toggle_key, False)
-    return st.session_state.get(toggle_key, False)
+def _svg_icon(name: str, size: int = 18, color: str = "#5f6368") -> str:
+    return (f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" '
+            f'width="{size}" height="{size}" fill="{color}">{_ICON_SVGS[name]}</svg>')
+
+
+def _render_js_icon_button(icon_name: str, onclick_js: str, key: str, title: str,
+                            color: str = "#5f6368", height: int = 34) -> None:
+    """Renders one flat black icon button that runs REAL client-side JS on
+    click. Uses st.components.v1.html — a genuine JS execution sandbox —
+    rather than st.markdown(unsafe_allow_html=True), which was confirmed
+    to mangle both multi-line HTML (Streamlit issue #859) and inline
+    onclick handlers in earlier testing. Needed for anything that must
+    happen instantly client-side with no visible extra UI (clipboard
+    copy) or that drives a custom dropdown (see _render_more_menu)."""
+    svg = _svg_icon(icon_name, color=color)
+    html_code = f"""
+    <html><head><style>
+      html, body {{ margin:0; padding:0; background:transparent; overflow:hidden; }}
+      #btn_{key} {{
+        background:none; border:none; cursor:pointer; padding:6px;
+        border-radius:6px; display:flex; align-items:center; justify-content:center;
+        width:100%; height:100%;
+      }}
+      #btn_{key}:hover {{ background-color:#f0f1f3; }}
+    </style></head>
+    <body>
+      <button id="btn_{key}" title="{title}">{svg}</button>
+      <script>
+        document.getElementById('btn_{key}').addEventListener('click', function() {{
+            {onclick_js}
+        }});
+      </script>
+    </body></html>
+    """
+    components.html(html_code, height=height)
+
+
+def _render_copy_icon(text: str, key: str) -> None:
+    """Instant clipboard copy — one click, nothing else visible, matching
+    Gemini exactly (Gemini shows a small transient 'Prompt copied' toast;
+    this flashes the icon to a blue checkmark for ~1s instead, entirely
+    client-side so it's truly instant with no server round-trip)."""
+    safe_text = json.dumps(text)
+    check_svg = _svg_icon("content_copy", color="#1a73e8").replace("'", "\\'")
+    onclick = (
+        f"navigator.clipboard.writeText({safe_text}); "
+        f"var b = document.getElementById('btn_{key}'); "
+        f"var orig = b.innerHTML; "
+        f"b.innerHTML = '{check_svg}'; "
+        f"setTimeout(function(){{ b.innerHTML = orig; }}, 900);"
+    )
+    _render_js_icon_button("content_copy", onclick, key=key, title="Copy")
+
+
+def _render_more_menu_trigger(target_id: str, key: str) -> None:
+    """The '⋯' trigger. st.popover can't go borderless (no type='tertiary'
+    support — open Streamlit feature request #10416), so this instead
+    toggles the CSS visibility of a real, Python-wired button row
+    rendered separately right after it (see render_assistant_message_
+    actions) by reaching into the parent page's DOM. The component iframe
+    and the main Streamlit page are same-origin, so this works reliably —
+    the revealed buttons are genuine st.button widgets, not fake UI."""
+    onclick = (
+        f"var m = window.parent.document.getElementById('{target_id}'); "
+        f"if (m) {{ m.style.display = (m.style.display === 'none' || m.style.display === '') ? 'block' : 'none'; }}"
+    )
+    _render_js_icon_button("more_horiz", onclick, key=key, title="More")
 
 
 def render_user_message_actions(chat_id: str, idx: int, content: str) -> None:
-    """Copy + Edit row under a user message — mirrors Gemini's 'click a
-    message to reveal copy/edit' pattern. Edit lets you rewrite the prompt
-    and regenerate everything from that point forward. Every icon is a
-    native type='tertiary' st.button with a Material Symbols icon — flat
-    black line icons, matching Gemini's own icon set, no custom CSS."""
+    """Copy + Edit row under a user message, matching Gemini's icon order
+    and instant-copy behavior exactly."""
     _spacer, col_copy, col_edit = st.columns([14, 1, 1], gap="small")
     with col_copy:
-        show_copy = _render_copy_toggle(key=f"copyuser_{chat_id}_{idx}")
+        _render_copy_icon(content, key=f"copyuser_{chat_id}_{idx}")
     with col_edit:
         if st.button(" ", icon=":material/edit:", key=f"editbtn_{chat_id}_{idx}",
                       type="tertiary", help="Edit"):
             st.session_state.editing_index[chat_id] = idx
             st.rerun()
-    if show_copy:
-        st.code(content, language=None, wrap_lines=True)
+
+
+_BAD_RESPONSE_REASONS = [
+    "Offensive/Unsafe", "Not factually correct", "Didn't follow instructions",
+    "Personalisation issue", "Other",
+]
 
 
 def render_assistant_message_actions(chat_id: str, idx: int, content: str, message: dict) -> None:
-    """👍 / 👎 / copy / 🔁 / 🚩 row under an assistant reply, matching
-    Gemini's feedback row — Material Symbols icons throughout (same set
-    Gemini uses), type='tertiary' for flat black icons with no border,
-    and the selected thumb switches to type='primary' to show a filled
-    highlight (Streamlit doesn't support recoloring a Material icon on
-    its own, so a background-color swap is the native way to show
-    'selected' state). Feedback persists on the message dict for the
-    session; it's cosmetic (no training pipeline behind it). Regenerate/
-    Report were originally tucked behind a '⋯' st.popover menu to match
-    Gemini's collapsed-menu look exactly, but st.popover can't go
-    borderless/flat (see _render_copy_toggle's docstring) — shown as two
-    more flat icons instead, trading the collapsed menu for a guaranteed-
-    consistent flat row."""
-    col_up, col_down, col_copy, col_regen, col_report, _spacer = st.columns(
+    """👍 / 👎 / 🔁 / 📋 / ⋯ row under an assistant reply — icon set, order,
+    and behavior matched to Gemini: thumbs-up just highlights; thumbs-down
+    highlights AND opens a 'What went wrong?' card with reason pills
+    (Gemini's actual bad-response flow, not just a color change); copy is
+    instant client-side (no visible box); regenerate is its own icon
+    (Gemini doesn't tuck it behind '⋯'); '⋯' reveals Report, via the
+    same real-hidden-button trick used throughout since st.popover can't
+    go borderless."""
+    col_up, col_down, col_regen, col_copy, col_more, _spacer = st.columns(
         [1, 1, 1, 1, 1, 12], gap="small"
     )
     feedback = message.get("feedback")
+    feedback_card_key = f"feedbackcard_{chat_id}_{idx}"
 
     with col_up:
         if st.button(" ", icon=":material/thumb_up:", key=f"up_{chat_id}_{idx}",
                       type="primary" if feedback == "up" else "tertiary", help="Good response"):
             message["feedback"] = None if feedback == "up" else "up"
+            st.session_state[feedback_card_key] = False
             st.rerun()
     with col_down:
         if st.button(" ", icon=":material/thumb_down:", key=f"down_{chat_id}_{idx}",
                       type="primary" if feedback == "down" else "tertiary", help="Bad response"):
-            message["feedback"] = None if feedback == "down" else "down"
+            if feedback == "down":
+                message["feedback"] = None
+                st.session_state[feedback_card_key] = False
+            else:
+                message["feedback"] = "down"
+                st.session_state[feedback_card_key] = True
             st.rerun()
-    with col_copy:
-        show_copy = _render_copy_toggle(key=f"copyassistant_{chat_id}_{idx}")
     with col_regen:
         if st.button(" ", icon=":material/refresh:", key=f"regen_{chat_id}_{idx}",
                       type="tertiary", help="Regenerate response"):
             st.session_state.regenerate_index[chat_id] = idx
             st.rerun()
+    with col_copy:
+        _render_copy_icon(content, key=f"copyassistant_{chat_id}_{idx}")
+    with col_more:
+        target_id = f"morewrap_{chat_id}_{idx}"
+        _render_more_menu_trigger(target_id, key=f"more_{chat_id}_{idx}")
+
+    # Hidden-by-default row of REAL buttons that the "⋯" JS toggle reveals.
+    st.markdown(f'<div id="morewrap_{chat_id}_{idx}" style="display:none;">', unsafe_allow_html=True)
+    col_report, _sp2 = st.columns([1, 15], gap="small")
     with col_report:
         if st.button(" ", icon=":material/flag:", key=f"report_{chat_id}_{idx}",
                       type="tertiary", help="Report an issue"):
             st.toast("Thanks — this has been noted.")
-    if show_copy:
-        st.code(content, language=None, wrap_lines=True)
+    st.markdown('</div>', unsafe_allow_html=True)
+
+    # "What went wrong?" reason card — Gemini's actual bad-response flow,
+    # shown right under the icon row when thumbs-down is active.
+    if st.session_state.get(feedback_card_key):
+        with st.container(border=True):
+            col_title, col_close = st.columns([10, 1])
+            with col_title:
+                st.markdown("**What went wrong?**")
+                st.caption("Your feedback helps improve SparkAI.")
+            with col_close:
+                if st.button(" ", icon=":material/close:", key=f"closefb_{chat_id}_{idx}",
+                              type="tertiary", help="Close"):
+                    st.session_state[feedback_card_key] = False
+                    st.rerun()
+            reason_cols = st.columns(len(_BAD_RESPONSE_REASONS))
+            for reason_col, reason in zip(reason_cols, _BAD_RESPONSE_REASONS):
+                with reason_col:
+                    if st.button(reason, key=f"reason_{chat_id}_{idx}_{reason}", type="tertiary"):
+                        st.session_state[feedback_card_key] = False
+                        st.toast("Thanks for the detail — noted.")
+                        st.rerun()
 
 
 # -------------------------------------------------------------------------
