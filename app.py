@@ -194,7 +194,7 @@ def render_user_message_actions(chat_id: str, idx: int, content: str) -> None:
 
 _BAD_RESPONSE_REASONS = [
     "Offensive/Unsafe", "Not factually correct", "Didn't follow instructions",
-    "Personalisation issue", "Other",
+    "Personalisation issue", "More...", "Other",
 ]
 
 
@@ -244,9 +244,14 @@ def render_assistant_message_actions(chat_id: str, idx: int, content: str, messa
                 st.toast("Thanks — this has been noted.")
 
     # "What went wrong?" reason card — Gemini's actual bad-response flow,
-    # shown right under the icon row when thumbs-down is active.
+    # shown right under the icon row when thumbs-down is active. Reason
+    # chips use st.container(horizontal=True), which natively flex-wraps
+    # (overflows to the next line) and lets each button size to its own
+    # text instead of being stretched into an equal-width grid cell — that
+    # equal-width-columns approach was what made the old version look like
+    # a grid of boxes instead of Gemini's flowing pill row.
     if st.session_state.get(feedback_card_key):
-        with st.container(border=True):
+        with st.container(border=True, key=f"feedbackpanel_{chat_id}_{idx}"):
             col_title, col_close = st.columns([10, 1])
             with col_title:
                 st.markdown("**What went wrong?**")
@@ -256,10 +261,9 @@ def render_assistant_message_actions(chat_id: str, idx: int, content: str, messa
                               type="tertiary", help="Close"):
                     st.session_state[feedback_card_key] = False
                     st.rerun()
-            reason_cols = st.columns(len(_BAD_RESPONSE_REASONS))
-            for reason_col, reason in zip(reason_cols, _BAD_RESPONSE_REASONS):
-                with reason_col:
-                    if st.button(reason, key=f"reason_{chat_id}_{idx}_{reason}", type="tertiary"):
+            with st.container(key=f"reasons_{chat_id}_{idx}", horizontal=True, gap="small"):
+                for reason in _BAD_RESPONSE_REASONS:
+                    if st.button(reason, key=f"reason_{chat_id}_{idx}_{reason}"):
                         st.session_state[feedback_card_key] = False
                         st.toast("Thanks for the detail — noted.")
                         st.rerun()
@@ -528,6 +532,34 @@ st.markdown("""
 
     #MainMenu {visibility: hidden;}
     footer {visibility: hidden;}
+
+    /* ---- "What went wrong?" feedback reason chips — real pill buttons,
+       auto-sized to their own text and flex-wrapping, not a grid of
+       equal-width boxes. [class*="..."] is a substring match on the class
+       attribute, needed because the container's key (and so its
+       st-key-<key> class) includes the dynamic chat/message id — this
+       still matches every instance since they all share the "reasons_"
+       prefix. st-key- itself is Streamlit's own documented CSS hook for
+       st.container(key=...), not a private/undocumented testid. ---- */
+    div[class*="st-key-reasons_"] button {
+        background-color: #f0f1f3 !important;
+        border: none !important;
+        border-radius: 20px !important;
+        color: #1f1f1f !important;
+        padding: 8px 18px !important;
+        font-size: 14px !important;
+        min-height: unset !important;
+    }
+    div[class*="st-key-reasons_"] button:hover {
+        background-color: #e0e2e5 !important;
+    }
+    /* The floating feedback card itself — slightly more rounded + a soft
+       shadow so it reads as a floating card rather than a plain bordered
+       box. */
+    div[class*="st-key-feedbackpanel_"] {
+        border-radius: 16px !important;
+        box-shadow: 0 1px 6px rgba(0, 0, 0, 0.12);
+    }
     </style>
 """, unsafe_allow_html=True)
 
