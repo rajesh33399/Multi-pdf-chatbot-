@@ -72,18 +72,43 @@ def switch_to(chat_id: str) -> None:
     st.session_state.confirm_delete_id = None
 
 
-def _bubble_div_html(content: str) -> str:
-    """Just the bubble <div> — no outer row wrapper. Used by
-    render_message_bubble/render_message_column, which add the row wrapper
-    themselves so native Streamlit toolbar widgets can be nested inside it."""
-    body_html = md_lib.markdown(html.escape(content), extensions=["sane_lists"])
-    return f'<div class="sparkai-bubble">{body_html}</div>'
+def _copy_button_html(text: str) -> str:
+    """A plain HTML button with an inline onclick — real DOM, not a
+    <script> tag, so the browser wires up the click handler normally even
+    though it arrived via st.markdown(unsafe_allow_html=True). Gives a true
+    one-click clipboard copy with no Python round-trip/rerun needed. Uses
+    an inline SVG (Material Symbols' "content_copy" glyph) rather than an
+    emoji, since emoji glyph support/rendering is inconsistent across
+    fonts — this renders identically everywhere."""
+    js_safe = (
+        text.replace("\\", "\\\\").replace("'", "\\'")
+        .replace("\n", "\\n").replace("\r", "")
+    )
+    svg = (
+        '<svg xmlns="http://www.w3.org/2000/svg" height="18" viewBox="0 -960 960 960" '
+        'width="18" fill="currentColor"><path d="M360-240q-33 0-56.5-23.5T280-320v-480q0-33 '
+        '23.5-56.5T360-880h360q33 0 56.5 23.5T800-800v480q0 33-23.5 56.5T720-240H360Zm0-80h360'
+        'v-480H360v480ZM200-80q-33 0-56.5-23.5T120-160v-560h80v560h440v80H200Z"/></svg>'
+    )
+    return (
+        f'<button class="sparkai-copy-btn" title="Copy" '
+        f"onclick=\"navigator.clipboard.writeText('{js_safe}'); "
+        f"this.classList.add('copied'); setTimeout(()=>this.classList.remove('copied'), 1200);\">"
+        f"{svg}</button>"
+    )
 
 
 def _build_bubble_html(role: str, content: str) -> str:
-    """Full self-contained row+bubble (no toolbar). Used for the live
-    streaming placeholder, where a toolbar doesn't make sense yet since the
-    message isn't finished/saved."""
+    """Full self-contained row+bubble in ONE markdown call — this matters:
+    Streamlit renders each st.markdown()/st.button() call as its own
+    independently-parsed HTML fragment, so any tag left "open" in one call
+    to embrace widgets from later calls just gets silently auto-closed by
+    the browser and never actually nests. Keeping the whole bubble in a
+    single call is what makes the styling (grey pill / sparkle row)
+    actually apply. The icon toolbar is rendered as a separate block right
+    below via st.columns (Streamlit's own real layout primitive) rather
+    than trying to nest it inside this div — see render_user_message /
+    render_assistant_message."""
     body_html = md_lib.markdown(html.escape(content), extensions=["sane_lists"])
     if role == "user":
         return f'<div class="sparkai-msg sparkai-user"><div class="sparkai-bubble">{body_html}</div></div>'
@@ -94,100 +119,63 @@ def _build_bubble_html(role: str, content: str) -> str:
     )
 
 
-def open_message_column(role: str) -> None:
-    """Open a message row PLUS an inner column wrapper, so that native
-    Streamlit widgets (buttons/popovers) added between this and
-    close_message_column() stack BELOW the bubble as a toolbar, instead of
-    beside it. Same DOM-sibling-ordering trick as open_assistant_media_row,
-    just with a column wrapper added so multiple children stack vertically."""
-    if role == "user":
-        st.markdown(
-            '<div class="sparkai-msg sparkai-user"><div class="sparkai-msg-col">',
-            unsafe_allow_html=True,
-        )
-    else:
-        st.markdown(
-            '<div class="sparkai-msg sparkai-assistant">'
-            '<span class="sparkai-sparkle">✨</span><div class="sparkai-msg-col">',
-            unsafe_allow_html=True,
-        )
-
-
-def close_message_column() -> None:
-    st.markdown('</div></div>', unsafe_allow_html=True)
-
-
-def _copy_button_html(text: str) -> str:
-    """A plain HTML button with an inline onclick — this is real DOM (not a
-    <script> tag), so the browser wires up the click handler normally even
-    though it arrived via st.markdown(unsafe_allow_html=True). Gives a true
-    one-click clipboard copy with no Python round-trip/rerun needed."""
-    # JS string-escape (not HTML-escape) since this lands inside a JS string
-    # literal in the onclick attribute.
-    js_safe = (
-        text.replace("\\", "\\\\").replace("'", "\\'")
-        .replace("\n", "\\n").replace("\r", "")
-    )
-    return (
-        f"<button class=\"sparkai-copy-btn\" title=\"Copy\" "
-        f"onclick=\"navigator.clipboard.writeText('{js_safe}'); "
-        f"this.textContent='✅'; setTimeout(()=>this.textContent='📋', 1200);\">"
-        f"📋</button>"
-    )
-
-
 def render_message_bubble(role: str, content: str) -> None:
     """Render one text message as a plain HTML bubble, no toolbar. Used for
-    the user's own message right after they hit send, and other places
-    where a toolbar isn't needed (e.g. before the message is persisted)."""
+    the user's own message right after they hit send (before it's part of
+    persisted history) and for the live-streaming assistant placeholder."""
     st.markdown(_build_bubble_html(role, content), unsafe_allow_html=True)
 
 
 def render_user_message(message: dict) -> None:
-    """User message bubble + hover-independent toolbar: Copy, Edit."""
+    """User message bubble + a compact icon row directly below it: Copy,
+    Edit. A big leading spacer column pushes the icons to hug the right
+    edge, echoing the right-aligned bubble above."""
     mid = message.get("id", "")
-    open_message_column("user")
-    st.markdown(_bubble_div_html(message["content"]), unsafe_allow_html=True)
-    st.markdown('<div class="sparkai-toolbar">', unsafe_allow_html=True)
-    st.markdown(_copy_button_html(message["content"]), unsafe_allow_html=True)
-    if st.button("✏️", key=f"edit_{mid}", help="Edit this message"):
-        chat["editing_id"] = mid
-        st.rerun()
-    st.markdown('</div>', unsafe_allow_html=True)
-    close_message_column()
+    st.markdown(_build_bubble_html("user", message["content"]), unsafe_allow_html=True)
+    _spacer, c_copy, c_edit = st.columns([0.86, 0.07, 0.07])
+    with c_copy:
+        st.markdown(_copy_button_html(message["content"]), unsafe_allow_html=True)
+    with c_edit:
+        if st.button("", key=f"edit_{mid}", help="Edit", type="tertiary", icon=":material/edit:"):
+            chat["editing_id"] = mid
+            st.rerun()
 
 
 def render_assistant_message(message: dict, idx: int) -> None:
     """Assistant message bubble + toolbar: Copy, thumbs up/down, and a
     '⋮' menu with Regenerate / Delete — mirrors Gemini's per-response
-    action row."""
+    action row. A trailing spacer column keeps the icons hugging the left
+    edge, under the sparkle+bubble above."""
     mid = message.get("id", "")
-    open_message_column("assistant")
-    st.markdown(_bubble_div_html(message["content"]), unsafe_allow_html=True)
-    st.markdown('<div class="sparkai-toolbar">', unsafe_allow_html=True)
-    st.markdown(_copy_button_html(message["content"]), unsafe_allow_html=True)
+    st.markdown(_build_bubble_html("assistant", message["content"]), unsafe_allow_html=True)
 
     feedback = chat.setdefault("feedback", {})
-    if st.button("👍", key=f"up_{mid}", help="Good response"):
-        feedback[mid] = "up"
-        st.toast("Thanks for the feedback! 👍")
-    if st.button("👎", key=f"down_{mid}", help="Bad response"):
-        feedback[mid] = "down"
-        st.toast("Thanks for the feedback — noted. 👎")
-
-    with st.popover("⋮", use_container_width=False):
-        if st.button("🔁 Regenerate", key=f"regen_{mid}"):
-            prev = chat["messages"][idx - 1] if idx > 0 else None
-            if prev and prev.get("type", "text") == "text" and prev["role"] == "user":
-                chat["messages"] = chat["messages"][:idx]
-                chat["pending_regen"] = prev["content"]
-            st.rerun()
-        if st.button("🗑️ Delete", key=f"del_{mid}"):
-            del chat["messages"][idx]
-            st.rerun()
-
-    st.markdown('</div>', unsafe_allow_html=True)
-    close_message_column()
+    c_copy, c_up, c_down, c_more, _spacer = st.columns([0.05, 0.05, 0.05, 0.05, 0.80])
+    with c_copy:
+        st.markdown(_copy_button_html(message["content"]), unsafe_allow_html=True)
+    with c_up:
+        liked = feedback.get(mid) == "up"
+        if st.button("", key=f"up_{mid}", help="Good response", type="tertiary",
+                     icon=":material/thumb_up:" if not liked else ":material/check:"):
+            feedback[mid] = "up"
+            st.toast("Thanks for the feedback! 👍")
+    with c_down:
+        disliked = feedback.get(mid) == "down"
+        if st.button("", key=f"down_{mid}", help="Bad response", type="tertiary",
+                     icon=":material/thumb_down:" if not disliked else ":material/check:"):
+            feedback[mid] = "down"
+            st.toast("Thanks for the feedback — noted. 👎")
+    with c_more:
+        with st.popover("", icon=":material/more_vert:", use_container_width=False):
+            if st.button("Regenerate", key=f"regen_{mid}", icon=":material/refresh:", use_container_width=True):
+                prev = chat["messages"][idx - 1] if idx > 0 else None
+                if prev and prev.get("type", "text") == "text" and prev["role"] == "user":
+                    chat["messages"] = chat["messages"][:idx]
+                    chat["pending_regen"] = prev["content"]
+                st.rerun()
+            if st.button("Delete", key=f"del_{mid}", icon=":material/delete:", use_container_width=True):
+                del chat["messages"][idx]
+                st.rerun()
 
 
 def open_assistant_media_row() -> None:
@@ -440,63 +428,31 @@ st.markdown("""
     .sparkai-bubble p:last-child { margin-bottom: 0; }
     .sparkai-bubble ol, .sparkai-bubble ul { margin: 6px 0; padding-left: 22px; }
 
-    /* ---- Column wrapper so the toolbar (native Streamlit buttons/popover)
-       stacks BELOW the bubble instead of beside it — see
-       open_message_column() in app.py. ---- */
-    .sparkai-msg-col {
-        display: flex;
-        flex-direction: column;
-        max-width: 85%;
-    }
-    .sparkai-msg.sparkai-user .sparkai-msg-col {
-        align-items: flex-end;
-        max-width: 70%;
-    }
-    .sparkai-msg.sparkai-user .sparkai-msg-col .sparkai-bubble {
-        max-width: 100%;
-    }
-    .sparkai-msg.sparkai-assistant .sparkai-msg-col {
-        align-items: flex-start;
-    }
-
-    /* ---- Per-message action row (Copy / Edit / 👍 / 👎 / ⋮), Gemini-style.
-       "display: contents" on Streamlit's own wrapper divs collapses them
-       out of the box model so only the actual <button>/<popover> inside
-       becomes a flex item of .sparkai-toolbar — these are real testids
-       confirmed to exist in Streamlit's shipped frontend, same approach as
-       the sidebar reskin above. ---- */
-    .sparkai-toolbar {
-        display: flex;
-        align-items: center;
-        gap: 0px;
+    /* ---- Copy button (raw HTML, not a Streamlit widget — see
+       _copy_button_html in app.py). Plain class selector, so this is safe
+       regardless of exactly where in the DOM the button ends up. ---- */
+    .sparkai-copy-btn {
+        background: transparent;
+        border: none;
+        color: #5f6368;
+        padding: 6px;
         margin-top: 2px;
-    }
-    .sparkai-toolbar [data-testid="stVerticalBlockBorderWrapper"],
-    .sparkai-toolbar [data-testid="stVerticalBlock"],
-    .sparkai-toolbar [data-testid="element-container"],
-    .sparkai-toolbar [data-testid="stButton"],
-    .sparkai-toolbar [data-testid="stPopover"] {
-        display: contents;
-    }
-    .sparkai-toolbar button,
-    .sparkai-toolbar .sparkai-copy-btn {
-        background: transparent !important;
-        border: none !important;
-        color: #5f6368 !important;
-        font-size: 13px !important;
-        padding: 4px 7px !important;
-        min-height: unset !important;
-        line-height: 1 !important;
-        border-radius: 14px !important;
+        border-radius: 50%;
         cursor: pointer;
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
     }
-    .sparkai-toolbar button:hover,
-    .sparkai-toolbar .sparkai-copy-btn:hover {
-        background-color: #e8eaed !important;
-    }
-    /* The "⋮" popover trigger button itself */
-    .sparkai-toolbar [data-testid="stPopover"] > div > button {
-        font-size: 16px !important;
+    .sparkai-copy-btn:hover { background-color: #e8eaed; }
+    .sparkai-copy-btn.copied { color: #1a73e8; }
+
+    /* Pull the icon-row (st.columns, rendered right after each bubble)
+       up closer to the bubble above it — Streamlit adds some vertical
+       gap between blocks by default that looks too loose for a compact
+       message action row. */
+    .sparkai-msg + div[data-testid="stHorizontalBlock"] {
+        margin-top: -10px;
+        margin-bottom: 4px;
     }
 
     /* ---- Reskin the chat_input's built-in attach control to a plain
@@ -658,7 +614,6 @@ for idx, message in enumerate(chat["messages"]):
 
     if msg_type == "text" and message["role"] == "user" and chat["editing_id"] == mid:
         # ---- Edit mode: swap the bubble for an editable text area ----
-        open_message_column("user")
         edited = st.text_area(
             "Edit message", value=message["content"], key=f"edit_area_{mid}",
             label_visibility="collapsed",
@@ -677,7 +632,6 @@ for idx, message in enumerate(chat["messages"]):
             if st.button("Cancel", key=f"cancel_edit_{mid}", use_container_width=True):
                 chat["editing_id"] = None
                 st.rerun()
-        close_message_column()
         continue
 
     if msg_type == "text":
