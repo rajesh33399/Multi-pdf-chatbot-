@@ -122,8 +122,6 @@ _ICON_SVGS = {
     "more_horiz": '<path d="M6 10c-1.1 0-2 .9-2 2s.9 2 2 2 2-.9 2-2-.9-2-2-2zm12 0c-1.1 0-2 .9-2 2s.9 2 2 2 2-.9 2-2-.9-2-2-2zm-6 0c-1.1 0-2 .9-2 2s.9 2 2 2 2-.9 2-2-.9-2-2-2z"/>',
     "flag": '<path d="M14.4 6L14 4H5v17h2v-7h6.6l.4 2h7V6z"/>',
     "edit": '<path d="M3 17.25V21h3.75L17.81 9.94l-3.75-3.75L3 17.25zM20.71 7.04c.39-.39.39-1.02 0-1.41l-2.34-2.34c-.39-.39-1.02-.39-1.41 0l-1.83 1.83 3.75 3.75 1.83-1.83z"/>',
-    "call_split": '<path d="M14 4l2.29 2.29-2.88 2.88 1.42 1.42 2.88-2.88L20 10V4h-6zM4 4v6l2.29-2.29 4.71 4.7V20h2v-8.41l-5.29-5.3L10 4H4z"/>',
-    "volume_up": '<path d="M3 9v6h4l5 5V4L7 9H3zm13.5 3c0-1.77-1.02-3.29-2.5-4.03v8.05c1.48-.73 2.5-2.25 2.5-4.02zM14 3.23v2.06c2.89.86 5 3.54 5 6.71s-2.11 5.85-5 6.71v2.06c4.01-.91 7-4.49 7-8.77s-2.99-7.86-7-8.77z"/>',
 }
 
 
@@ -140,7 +138,7 @@ def _render_js_icon_button(icon_name: str, onclick_js: str, key: str, title: str
     to mangle both multi-line HTML (Streamlit issue #859) and inline
     onclick handlers in earlier testing. Needed for anything that must
     happen instantly client-side with no visible extra UI (clipboard
-    copy) or that drives a custom dropdown (see _render_more_menu)."""
+    copy) or that toggles state client-side without a server round-trip."""
     svg = _svg_icon(icon_name, color=color)
     html_code = f"""
     <html><head><style>
@@ -181,73 +179,19 @@ def _render_copy_icon(text: str, key: str) -> None:
     _render_js_icon_button("content_copy", onclick, key=key, title="Copy")
 
 
-def _render_more_menu(text: str, chat_id: str, idx: int, key: str) -> None:
-    """Gemini's '⋯' menu, matched to the reference video exactly: three
-    items — Branch in new chat, Listen, Report legal issue. The trigger
-    AND the dropdown panel are both self-contained in one JS sandbox
-    (components.html), so opening/closing the menu itself needs no
-    parent-DOM reaching. 'Branch' and 'Report' need real Python-side
-    effects though (create a new chat / show a toast), so their clicks
-    reach into the parent page and .click() a real st.button — found via
-    a global attribute selector on that button's title (unique per
-    message, set via help=... — see render_assistant_message_actions),
-    NOT via any wrapping-div containment, which turned out unreliable
-    (see the CSS block's comment for why). 'Listen' is pure client-side
-    text-to-speech (window.speechSynthesis) — no Python round-trip at
-    all."""
+def _speak_text(text: str, key: str) -> None:
+    """Fires browser text-to-speech once via a tiny JS snippet. Called
+    right after a 'Listen' click sets a one-shot session_state flag (see
+    render_assistant_message_actions) — this way 'Listen' can be a REAL
+    st.button like everything else (no fragile cross-frame click-
+    simulation needed), while still getting genuine client-side speech
+    with no server-side audio generation required."""
     safe_text = json.dumps(text)
-    branch_title = f"sparkai-hidden-branch-{chat_id}-{idx}"
-    report_title = f"sparkai-hidden-report-{chat_id}-{idx}"
-    html_code = f"""
-    <html><head><style>
-      html, body {{ margin:0; padding:0; background:transparent; overflow:visible;
-                    font-family:-apple-system,"Segoe UI",Roboto,sans-serif; }}
-      #trigger_{key} {{
-        background:none; border:none; cursor:pointer; padding:6px;
-        border-radius:6px; display:flex; align-items:center; justify-content:center;
-      }}
-      #trigger_{key}:hover {{ background-color:#f0f1f3; }}
-      #menu_{key} {{
-        display:none; margin-top:2px; background:#fff; border-radius:8px;
-        box-shadow:0 1px 3px rgba(0,0,0,0.3); width:240px; padding:6px 0;
-      }}
-      .mi_{key} {{
-        display:flex; align-items:center; gap:12px; padding:8px 14px;
-        cursor:pointer; font-size:14px; color:#1f1f1f; white-space:nowrap;
-      }}
-      .mi_{key}:hover {{ background-color:#f0f1f3; }}
-    </style></head>
-    <body>
-      <button id="trigger_{key}" title="More">{_svg_icon('more_horiz')}</button>
-      <div id="menu_{key}">
-        <div class="mi_{key}" id="branch_{key}">{_svg_icon('call_split', size=16)}<span>Branch in new chat</span></div>
-        <div class="mi_{key}" id="listen_{key}">{_svg_icon('volume_up', size=16)}<span>Listen</span></div>
-        <div class="mi_{key}" id="reportmi_{key}">{_svg_icon('flag', size=16)}<span>Report legal issue</span></div>
-      </div>
-      <script>
-        var menu = document.getElementById('menu_{key}');
-        document.getElementById('trigger_{key}').addEventListener('click', function() {{
-            menu.style.display = (menu.style.display === 'none' || menu.style.display === '') ? 'block' : 'none';
-        }});
-        document.getElementById('branch_{key}').addEventListener('click', function() {{
-            var btn = window.parent.document.querySelector('button[title="{branch_title}"]');
-            if (btn) {{ btn.click(); }}
-            menu.style.display = 'none';
-        }});
-        document.getElementById('listen_{key}').addEventListener('click', function() {{
-            window.speechSynthesis.cancel();
-            window.speechSynthesis.speak(new SpeechSynthesisUtterance({safe_text}));
-            menu.style.display = 'none';
-        }});
-        document.getElementById('reportmi_{key}').addEventListener('click', function() {{
-            var btn = window.parent.document.querySelector('button[title="{report_title}"]');
-            if (btn) {{ btn.click(); }}
-            menu.style.display = 'none';
-        }});
-      </script>
-    </body></html>
-    """
-    components.html(html_code, height=210)
+    components.html(
+        f"<script>window.speechSynthesis.cancel();"
+        f"window.speechSynthesis.speak(new SpeechSynthesisUtterance({safe_text}));</script>",
+        height=0,
+    )
 
 
 def _branch_chat(chat_id: str, idx: int) -> None:
@@ -282,19 +226,55 @@ _BAD_RESPONSE_REASONS = [
 
 
 def render_assistant_message_actions(chat_id: str, idx: int, content: str, message: dict) -> None:
-    """👍 / 👎 / 🔁 / 📋 / ⋯ row under an assistant reply — icon set, order,
-    and behavior matched to Gemini: thumbs-up just highlights; thumbs-down
-    highlights AND opens a 'What went wrong?' card with reason pills
-    (Gemini's actual bad-response flow, not just a color change); copy is
-    instant client-side (no visible box); regenerate is its own icon
-    (Gemini doesn't tuck it behind '⋯'); '⋯' opens a real dropdown with
-    Branch in new chat / Listen / Report legal issue (see _render_more_
-    menu) — matched to Gemini's own menu exactly, not the generic set."""
+    """👍 / 👎 / 🔁 / 📋 / ⋯ row under an assistant reply — icon set and
+    order matched to Gemini. Thumbs-up just highlights; thumbs-down
+    highlights AND opens a 'What went wrong?' reason-pill card; copy is
+    instant client-side (no visible box, no server round-trip); '⋯' opens
+    a menu with Branch in new chat / Listen / Report legal issue, shown
+    ABOVE the icon row (matching the reference video) using real, native
+    st.button widgets with full text labels — not custom HTML. An earlier
+    version tried hiding real buttons inside a raw `display:none` div and
+    clicking them via cross-frame JS; that div-wrapping trick turned out
+    to only work for decorative content, not interactive widgets (the
+    buttons rendered as empty visible boxes instead of staying hidden —
+    confirmed in testing), so this drops that approach entirely in favor
+    of plain session_state-driven conditional rendering, which is slower
+    by one rerun but 100% reliable."""
+    more_key = f"showmore_{chat_id}_{idx}"
+    feedback = message.get("feedback")
+    feedback_card_key = f"feedbackcard_{chat_id}_{idx}"
+    speak_key = f"speaknow_{chat_id}_{idx}"
+
+    # "⋯" menu — rendered ABOVE the icon row per the Gemini reference.
+    if st.session_state.get(more_key):
+        with st.container(border=True):
+            if st.button("Branch in new chat", icon=":material/call_split:",
+                          key=f"branchbtn_{chat_id}_{idx}", type="tertiary",
+                          use_container_width=True):
+                _branch_chat(chat_id, idx)
+                st.session_state[more_key] = False
+                st.rerun()
+            if st.button("Listen", icon=":material/volume_up:",
+                          key=f"listenbtn_{chat_id}_{idx}", type="tertiary",
+                          use_container_width=True):
+                st.session_state[speak_key] = True
+                st.session_state[more_key] = False
+                st.rerun()
+            if st.button("Report legal issue", icon=":material/flag:",
+                          key=f"reportbtn_{chat_id}_{idx}", type="tertiary",
+                          use_container_width=True):
+                st.toast("Thanks — this has been reported.")
+                st.session_state[more_key] = False
+                st.rerun()
+
+    # Fires browser text-to-speech once, right after 'Listen' is clicked
+    # above (the flag is cleared immediately so it only speaks once).
+    if st.session_state.pop(speak_key, False):
+        _speak_text(content, key=f"speak_{chat_id}_{idx}")
+
     col_up, col_down, col_regen, col_copy, col_more, _spacer = st.columns(
         [1, 1, 1, 1, 1, 12], gap="small"
     )
-    feedback = message.get("feedback")
-    feedback_card_key = f"feedbackcard_{chat_id}_{idx}"
 
     with col_up:
         if st.button(" ", icon=":material/thumb_up:", key=f"up_{chat_id}_{idx}",
@@ -320,21 +300,10 @@ def render_assistant_message_actions(chat_id: str, idx: int, content: str, messa
     with col_copy:
         _render_copy_icon(content, key=f"copyassistant_{chat_id}_{idx}")
     with col_more:
-        _render_more_menu(content, chat_id, idx, key=f"more_{chat_id}_{idx}")
-
-    # Permanently-hidden REAL buttons that the "⋯" menu's JS clicks
-    # programmatically (via querySelector) for the two items that need a
-    # genuine Python-side effect. Never shown to the user directly.
-    st.markdown(f'<div id="branchwrap_{chat_id}_{idx}" style="display:none;">', unsafe_allow_html=True)
-    if st.button(" ", key=f"branchbtn_{chat_id}_{idx}"):
-        _branch_chat(chat_id, idx)
-        st.rerun()
-    st.markdown('</div>', unsafe_allow_html=True)
-
-    st.markdown(f'<div id="reportwrap_{chat_id}_{idx}" style="display:none;">', unsafe_allow_html=True)
-    if st.button(" ", key=f"reportbtn_{chat_id}_{idx}"):
-        st.toast("Thanks — this has been reported.")
-    st.markdown('</div>', unsafe_allow_html=True)
+        if st.button(" ", icon=":material/more_horiz:", key=f"more_{chat_id}_{idx}",
+                      type="tertiary", help="More"):
+            st.session_state[more_key] = not st.session_state.get(more_key, False)
+            st.rerun()
 
     # "What went wrong?" reason card — Gemini's actual bad-response flow,
     # shown right under the icon row when thumbs-down is active.
@@ -621,26 +590,6 @@ st.markdown("""
 
     #MainMenu {visibility: hidden;}
     footer {visibility: hidden;}
-
-    /* Hides the two permanently-present "trigger" buttons that the '⋯'
-       menu's JS clicks programmatically (see _render_more_menu). Targets
-       the real <button> via its title attribute (set from help=... in
-       Python) — a genuine HTML attribute on the actual element. An
-       earlier attempt wrapped these in a raw <div style="display:none">
-       opened/closed across two separate st.markdown calls, matching the
-       pattern used for the (purely cosmetic) image/video message rows —
-       but that only coincidentally looked fine there; it turned out
-       Streamlit renders each markdown/button call as its own isolated
-       block, so the unclosed div did NOT reliably keep containing a
-       later widget, and the button stayed fully visible AND unfindable
-       via querySelector. Prefix-matching on the title (set uniquely per
-       message) sidesteps DOM-nesting entirely: this hides every such
-       button globally, and _render_more_menu's JS finds the exact one
-       for its own message via the same unique title, no containment
-       needed either way. */
-    button[title^="sparkai-hidden-"] {
-        display: none !important;
-    }
     </style>
 """, unsafe_allow_html=True)
 
