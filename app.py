@@ -246,26 +246,27 @@ def render_assistant_message_actions(chat_id: str, idx: int, content: str, messa
     speak_key = f"speaknow_{chat_id}_{idx}"
 
     # "⋯" menu — rendered ABOVE the icon row per the Gemini reference.
+    # No border/box (removed per user feedback — Gemini's dropdown reads
+    # as a plain floating list, not an outlined container).
     if st.session_state.get(more_key):
-        with st.container(border=True):
-            if st.button("Branch in new chat", icon=":material/call_split:",
-                          key=f"branchbtn_{chat_id}_{idx}", type="tertiary",
-                          use_container_width=True):
-                _branch_chat(chat_id, idx)
-                st.session_state[more_key] = False
-                st.rerun()
-            if st.button("Listen", icon=":material/volume_up:",
-                          key=f"listenbtn_{chat_id}_{idx}", type="tertiary",
-                          use_container_width=True):
-                st.session_state[speak_key] = True
-                st.session_state[more_key] = False
-                st.rerun()
-            if st.button("Report legal issue", icon=":material/flag:",
-                          key=f"reportbtn_{chat_id}_{idx}", type="tertiary",
-                          use_container_width=True):
-                st.toast("Thanks — this has been reported.")
-                st.session_state[more_key] = False
-                st.rerun()
+        if st.button("Branch in new chat", icon=":material/call_split:",
+                      key=f"branchbtn_{chat_id}_{idx}", type="tertiary",
+                      use_container_width=True):
+            _branch_chat(chat_id, idx)
+            st.session_state[more_key] = False
+            st.rerun()
+        if st.button("Listen", icon=":material/volume_up:",
+                      key=f"listenbtn_{chat_id}_{idx}", type="tertiary",
+                      use_container_width=True):
+            st.session_state[speak_key] = True
+            st.session_state[more_key] = False
+            st.rerun()
+        if st.button("Report legal issue", icon=":material/flag:",
+                      key=f"reportbtn_{chat_id}_{idx}", type="tertiary",
+                      use_container_width=True):
+            st.toast("Thanks — this has been reported.")
+            st.session_state[more_key] = False
+            st.rerun()
 
     # Fires browser text-to-speech once, right after 'Listen' is clicked
     # above (the flag is cleared immediately so it only speaks once).
@@ -306,25 +307,26 @@ def render_assistant_message_actions(chat_id: str, idx: int, content: str, messa
             st.rerun()
 
     # "What went wrong?" reason card — Gemini's actual bad-response flow,
-    # shown right under the icon row when thumbs-down is active.
+    # shown right under the icon row when thumbs-down is active. No
+    # border/box (removed per user feedback — Gemini's card reads as
+    # plain content, not an outlined container).
     if st.session_state.get(feedback_card_key):
-        with st.container(border=True):
-            col_title, col_close = st.columns([10, 1])
-            with col_title:
-                st.markdown("**What went wrong?**")
-                st.caption("Your feedback helps improve SparkAI.")
-            with col_close:
-                if st.button(" ", icon=":material/close:", key=f"closefb_{chat_id}_{idx}",
-                              type="tertiary", help="Close"):
+        col_title, col_close = st.columns([10, 1])
+        with col_title:
+            st.markdown("**What went wrong?**")
+            st.caption("Your feedback helps improve SparkAI.")
+        with col_close:
+            if st.button(" ", icon=":material/close:", key=f"closefb_{chat_id}_{idx}",
+                          type="tertiary", help="Close"):
+                st.session_state[feedback_card_key] = False
+                st.rerun()
+        reason_cols = st.columns(len(_BAD_RESPONSE_REASONS))
+        for reason_col, reason in zip(reason_cols, _BAD_RESPONSE_REASONS):
+            with reason_col:
+                if st.button(reason, key=f"reason_{chat_id}_{idx}_{reason}", type="tertiary"):
                     st.session_state[feedback_card_key] = False
+                    st.toast("Thanks for the detail — noted.")
                     st.rerun()
-            reason_cols = st.columns(len(_BAD_RESPONSE_REASONS))
-            for reason_col, reason in zip(reason_cols, _BAD_RESPONSE_REASONS):
-                with reason_col:
-                    if st.button(reason, key=f"reason_{chat_id}_{idx}_{reason}", type="tertiary"):
-                        st.session_state[feedback_card_key] = False
-                        st.toast("Thanks for the detail — noted.")
-                        st.rerun()
 
 
 # -------------------------------------------------------------------------
