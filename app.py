@@ -280,7 +280,7 @@ def render_assistant_message_actions(chat_id: str, idx: int, content: str, messa
     # equal-width-columns approach was what made the old version look like
     # a grid of boxes instead of Gemini's flowing pill row.
     if st.session_state.get(feedback_card_key):
-        with st.container(border=True, key=f"feedbackpanel_{chat_id}_{idx}"):
+        with st.container(border=False, key=f"feedbackpanel_{chat_id}_{idx}"):
             col_title, col_close = st.columns([10, 1])
             with col_title:
                 st.markdown("**What went wrong?**")
@@ -582,12 +582,20 @@ st.markdown("""
     div[class*="st-key-reasons_"] button:hover {
         background-color: #e0e2e5 !important;
     }
-    /* The floating feedback card itself — slightly more rounded + a soft
-       shadow so it reads as a floating card rather than a plain bordered
-       box. */
+    /* The floating feedback card itself — border=False on the container
+       (see app.py) means Streamlit draws NO box of its own here; this
+       rule is what actually creates the card surface: white background,
+       one thin subtle border, soft shadow, rounded corners, and internal
+       padding. Previously this stacked CSS rounding on TOP of Streamlit's
+       own default straight-edged border=True box, which is what produced
+       the mismatched "still a box" look. */
     div[class*="st-key-feedbackpanel_"] {
-        border-radius: 16px !important;
-        box-shadow: 0 1px 6px rgba(0, 0, 0, 0.12);
+        background-color: #ffffff;
+        border: 1px solid #e8eaed;
+        border-radius: 16px;
+        box-shadow: 0 1px 6px rgba(0, 0, 0, 0.10);
+        padding: 18px 20px;
+        margin: 4px 0 12px 0;
     }
     </style>
 """, unsafe_allow_html=True)
