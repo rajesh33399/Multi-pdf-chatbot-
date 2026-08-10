@@ -169,41 +169,57 @@ SparkAI is an **LLM-powered multimodal AI assistant** built with **Python**, **S
                          │    AI Response      │
                          └─────────────────────┘
 
-                   🔄  RAG Pipeline
-             Uploaded Document
-       │
-       ▼
- Document Detection
-       │
-       ├──────────── PDF ─────────────┐
-       │                              │
-       ├──────────── DOCX ────────────┤
-       │                              │
-       └──────────── TXT / MD ────────┘
-                                      │
-                                      ▼
-                              Text Extraction
-                                      │
-                                      ▼
-                            Is Text Sufficient?
-                               │          │
-                              Yes         No
-                               │          │
-                               │          ▼
-                               │      Tesseract OCR
-                               │          │
-                               └────┬─────┘
+             
+
+
+
+
+
+
+
+
+
+
+
+
+
+🔄 RAG Pipeline
+
+
+Uploaded Document
+        │
+        ▼
+Document Detection
+        │
+        ├──────────── PDF ─────────────┐
+        │                              │
+        ├──────────── DOCX ────────────┤
+        │                              │
+        └──────────── TXT / MD ────────┘
+                                   │
+                                   ▼
+                            Text Extraction
+                                   │
+                                   ▼
+                           Is Text Sufficient?
+                               │         │
+                              Yes        No
+                               │         │
+                               │         ▼
+                               │    Tesseract OCR
+                               │         │
+                               └────┬────┘
                                     │
                                     ▼
-                              Text Chunking
+                             Text Chunking
                                     │
                                     ▼
                          Sentence Transformer
                               Embeddings
                                     │
                                     ▼
-                                 FAISS
-                            Vector Index
+                                  FAISS
+                               Vector Index
                                     │
                                     ▼
                            Semantic Retrieval
@@ -212,27 +228,45 @@ SparkAI is an **LLM-powered multimodal AI assistant** built with **Python**, **S
                             Relevant Context
                                     │
                                     ▼
-                            Gemini / Groq
+                             Gemini / Groq
                                     │
                                     ▼
-                              AI Response
+                               AI Response
 
 
-⚡ Performance Optimizations
+
+
+
+
+
+
+  ⚡ Performance Optimizations
+
+SparkAI implements several optimizations to reduce unnec
 
 SparkAI implements several optimizations to reduce unnecessary processing during document ingestion:
 
 Incremental Indexing — Only newly uploaded content is processed when adding documents to an existing vector store.
+
 Document Hashing — Previously processed documents can be identified without re-processing them.
+
 Batch Embedding — Embeddings are generated in batches to better control CPU and memory usage.
+
 Persistent FAISS Indexes — Vector indexes can be saved and reused.
+
 Embedding Model Caching — The embedding model is cached during the application lifecycle.
+
 Page-Level OCR Fallback — OCR is applied only to PDF pages where native extraction produces insufficient content.
+
 Duplicate Chunk Removal — Repeated chunks are removed before indexing.
+
+
+
+
 
 📁 Project Structure
 
-SparkAI/
+      SparkAI/
 │
 ├── .devcontainer/
 │   └── # Development container configuration
@@ -255,6 +289,8 @@ SparkAI/
 ├── text_splitter.py         # Document chunking and duplicate removal
 └── vector_store.py          # FAISS embeddings, indexing and retrieval
 
+
+
 ⚙️ Getting Started
 Prerequisites
 Python 3.10+
@@ -270,14 +306,18 @@ Google Gemini API key
 Groq API key
 
 Docker (optional)
+
+
 Install Tesseract and Poppler
 Ubuntu / Debian
-Bash
+
 sudo apt update
 sudo apt install tesseract-ocr poppler-utils
+
 macOS
-Bash
+
 brew install tesseract poppler
+
 📥 Installation
 1. Clone the Repository
 Bash
@@ -395,7 +435,9 @@ SparkAI currently supports document processing for:
 
 ZIP-based workflows may also be handled by the application where supported.
 
+
 🔐 Security
+
 API credentials are loaded through environment variables or Streamlit secrets.
 
 API keys should never be hard-coded into source files.
@@ -404,7 +446,9 @@ API keys should never be hard-coded into source files.
 
 Public repositories should never contain active API credentials.
 
+
 ⚠️ Limitations
+
 AI response quality depends on the selected LLM and the quality of the retrieved context.
 
 RAG responses depend on the quality of document extraction and semantic retrieval.
@@ -418,6 +462,8 @@ Image generation is experimental and generated results may not always match the 
 Free-tier API and hosting limits may affect response speed and availability.
 
 Large or scanned documents may require additional processing time because OCR and embedding generation are CPU-intensive.
+
+
 
 🚧 Future Improvements
 
@@ -441,7 +487,9 @@ Large or scanned documents may require additional processing time because OCR an
 
 🔐 User-Level Data Isolation — Separate uploaded documents and chat data between users.
 
+
 📌 Project Status
+
 SparkAI is an actively developed LLM application that combines general AI chat, multimodal image understanding, and document-based RAG in a single Streamlit application.
 
 The project focuses on integrating existing LLM and AI services rather than training a language model from scratch.
