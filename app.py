@@ -50,21 +50,6 @@ if "regenerate_index" not in st.session_state:
     st.session_state.regenerate_index = {}  # {chat_id: message_index or None}
 
 
-def _branch_chat(source_chat_id: str, up_to_idx: int) -> None:
-    """Gemini's 'Branch in new chat': copies everything up to and including
-    this message into a brand new chat and switches to it, leaving the
-    original conversation untouched — lets you explore a different
-    direction from this point without losing the original thread."""
-    source = st.session_state.chats[source_chat_id]
-    new_id = new_chat(source["mode"])  # also switches current_chat_id
-    st.session_state.chats[new_id]["messages"] = [
-        dict(m) for m in source["messages"][: up_to_idx + 1]
-    ]
-    st.session_state.chats[new_id]["context"] = source["context"]
-    st.session_state.chats[new_id]["uploaded_files"] = list(source["uploaded_files"])
-    st.session_state.chats[new_id]["title"] = (source["title"] or "Chat") + " (branch)"
-
-
 def new_chat(mode: str = "chat") -> str:
     chat_id = str(uuid.uuid4())
     st.session_state.chats[chat_id] = {
@@ -137,6 +122,8 @@ _ICON_SVGS = {
     "more_horiz": '<path d="M6 10c-1.1 0-2 .9-2 2s.9 2 2 2 2-.9 2-2-.9-2-2-2zm12 0c-1.1 0-2 .9-2 2s.9 2 2 2 2-.9 2-2-.9-2-2-2zm-6 0c-1.1 0-2 .9-2 2s.9 2 2 2 2-.9 2-2-.9-2-2-2z"/>',
     "flag": '<path d="M14.4 6L14 4H5v17h2v-7h6.6l.4 2h7V6z"/>',
     "edit": '<path d="M3 17.25V21h3.75L17.81 9.94l-3.75-3.75L3 17.25zM20.71 7.04c.39-.39.39-1.02 0-1.41l-2.34-2.34c-.39-.39-1.02-.39-1.41 0l-1.83 1.83 3.75 3.75 1.83-1.83z"/>',
+    "call_split": '<path d="M14 4l2.29 2.29-2.88 2.88 1.42 1.42 2.88-2.88L20 10V4h-6zM4 4v6l2.29-2.29 4.71 4.7V20h2v-8.41l-5.29-5.3L10 4H4z"/>',
+    "volume_up": '<path d="M3 9v6h4l5 5V4L7 9H3zm13.5 3c0-1.77-1.02-3.29-2.5-4.03v8.05c1.48-.73 2.5-2.25 2.5-4.02zM14 3.23v2.06c2.89.86 5 3.54 5 6.71s-2.11 5.85-5 6.71v2.06c4.01-.91 7-4.49 7-8.77s-2.99-7.86-7-8.77z"/>',
 }
 
 
@@ -194,6 +181,88 @@ def _render_copy_icon(text: str, key: str) -> None:
     _render_js_icon_button("content_copy", onclick, key=key, title="Copy")
 
 
+def _render_more_menu(text: str, chat_id: str, idx: int, key: str) -> None:
+    """Gemini's '⋯' menu, matched to the reference video exactly: three
+    items — Branch in new chat, Listen, Report legal issue. The trigger
+    AND the dropdown panel are both self-contained in one JS sandbox
+    (components.html), so opening/closing the menu itself needs no
+    parent-DOM reaching. 'Branch' and 'Report' need real Python-side
+    effects though (create a new chat / show a toast), so their clicks
+    reach into the parent page and .click() a real, permanently-hidden
+    st.button rendered right after this call (see render_assistant_
+    message_actions) — found via a wrapper div ID, then `querySelector
+    ('button')` inside it, since Streamlit's own generated button IDs
+    aren't stable to target directly. 'Listen' is pure client-side text-
+    to-speech (window.speechSynthesis) — no Python round-trip at all."""
+    safe_text = json.dumps(text)
+    branch_wrap_id = f"branchwrap_{chat_id}_{idx}"
+    report_wrap_id = f"reportwrap_{chat_id}_{idx}"
+    html_code = f"""
+    <html><head><style>
+      html, body {{ margin:0; padding:0; background:transparent; overflow:visible;
+                    font-family:-apple-system,"Segoe UI",Roboto,sans-serif; }}
+      #trigger_{key} {{
+        background:none; border:none; cursor:pointer; padding:6px;
+        border-radius:6px; display:flex; align-items:center; justify-content:center;
+      }}
+      #trigger_{key}:hover {{ background-color:#f0f1f3; }}
+      #menu_{key} {{
+        display:none; margin-top:2px; background:#fff; border-radius:8px;
+        box-shadow:0 1px 3px rgba(0,0,0,0.3); width:210px; padding:6px 0;
+      }}
+      .mi_{key} {{
+        display:flex; align-items:center; gap:12px; padding:8px 14px;
+        cursor:pointer; font-size:14px; color:#1f1f1f;
+      }}
+      .mi_{key}:hover {{ background-color:#f0f1f3; }}
+    </style></head>
+    <body>
+      <button id="trigger_{key}" title="More">{_svg_icon('more_horiz')}</button>
+      <div id="menu_{key}">
+        <div class="mi_{key}" id="branch_{key}">{_svg_icon('call_split', size=16)}<span>Branch in new chat</span></div>
+        <div class="mi_{key}" id="listen_{key}">{_svg_icon('volume_up', size=16)}<span>Listen</span></div>
+        <div class="mi_{key}" id="reportmi_{key}">{_svg_icon('flag', size=16)}<span>Report legal issue</span></div>
+      </div>
+      <script>
+        var menu = document.getElementById('menu_{key}');
+        document.getElementById('trigger_{key}').addEventListener('click', function() {{
+            menu.style.display = (menu.style.display === 'none' || menu.style.display === '') ? 'block' : 'none';
+        }});
+        document.getElementById('branch_{key}').addEventListener('click', function() {{
+            var wrap = window.parent.document.getElementById('{branch_wrap_id}');
+            var btn = wrap ? wrap.querySelector('button') : null;
+            if (btn) {{ btn.click(); }}
+            menu.style.display = 'none';
+        }});
+        document.getElementById('listen_{key}').addEventListener('click', function() {{
+            window.speechSynthesis.cancel();
+            window.speechSynthesis.speak(new SpeechSynthesisUtterance({safe_text}));
+            menu.style.display = 'none';
+        }});
+        document.getElementById('reportmi_{key}').addEventListener('click', function() {{
+            var wrap = window.parent.document.getElementById('{report_wrap_id}');
+            var btn = wrap ? wrap.querySelector('button') : null;
+            if (btn) {{ btn.click(); }}
+            menu.style.display = 'none';
+        }});
+      </script>
+    </body></html>
+    """
+    components.html(html_code, height=170)
+
+
+def _branch_chat(chat_id: str, idx: int) -> None:
+    """Copies this chat's messages up to and including `idx` into a new
+    chat and switches to it — mirrors Gemini's 'Branch in new chat'."""
+    source = st.session_state.chats[chat_id]
+    new_id = new_chat(source["mode"])
+    branched = st.session_state.chats[new_id]
+    branched["messages"] = [dict(m) for m in source["messages"][:idx + 1]]
+    branched["context"] = source["context"]
+    branched["uploaded_files"] = list(source["uploaded_files"])
+    branched["title"] = (source["title"] + " (branch)")[:60]
+
+
 def render_user_message_actions(chat_id: str, idx: int, content: str) -> None:
     """Copy + Edit row under a user message, matching Gemini's icon order
     and instant-copy behavior exactly."""
@@ -219,8 +288,9 @@ def render_assistant_message_actions(chat_id: str, idx: int, content: str, messa
     highlights AND opens a 'What went wrong?' card with reason pills
     (Gemini's actual bad-response flow, not just a color change); copy is
     instant client-side (no visible box); regenerate is its own icon
-    (Gemini doesn't tuck it behind '⋯'); '⋯' is a real st.popover holding
-    Report — no more custom JS/iframe DOM-reaching hack."""
+    (Gemini doesn't tuck it behind '⋯'); '⋯' opens a real dropdown with
+    Branch in new chat / Listen / Report legal issue (see _render_more_
+    menu) — matched to Gemini's own menu exactly, not the generic set."""
     col_up, col_down, col_regen, col_copy, col_more, _spacer = st.columns(
         [1, 1, 1, 1, 1, 12], gap="small"
     )
@@ -251,36 +321,26 @@ def render_assistant_message_actions(chat_id: str, idx: int, content: str, messa
     with col_copy:
         _render_copy_icon(content, key=f"copyassistant_{chat_id}_{idx}")
     with col_more:
-        with st.popover(" ", icon=":material/more_vert:", type="tertiary",
-                         use_container_width=False, help="More"):
-            if st.button("Branch in new chat", icon=":material/call_split:",
-                         key=f"branch_{chat_id}_{idx}", use_container_width=True):
-                _branch_chat(chat_id, idx)
-                st.rerun()
-            if st.button("Listen", icon=":material/volume_up:",
-                         key=f"listen_{chat_id}_{idx}", use_container_width=True):
-                # Real text-to-speech via the browser's built-in Web Speech
-                # API — no external TTS service/API key needed, and it's
-                # instant since it's entirely client-side.
-                safe_text = json.dumps(content)
-                components.html(
-                    f"<script>window.speechSynthesis.cancel();"
-                    f"window.speechSynthesis.speak(new SpeechSynthesisUtterance({safe_text}));</script>",
-                    height=0,
-                )
-            if st.button("Report legal issue", icon=":material/flag:",
-                         key=f"report_{chat_id}_{idx}", use_container_width=True):
-                st.toast("Thanks — this has been noted.")
+        _render_more_menu(content, chat_id, idx, key=f"more_{chat_id}_{idx}")
+
+    # Permanently-hidden REAL buttons that the "⋯" menu's JS clicks
+    # programmatically (via querySelector) for the two items that need a
+    # genuine Python-side effect. Never shown to the user directly.
+    st.markdown(f'<div id="branchwrap_{chat_id}_{idx}" style="display:none;">', unsafe_allow_html=True)
+    if st.button(" ", key=f"branchbtn_{chat_id}_{idx}"):
+        _branch_chat(chat_id, idx)
+        st.rerun()
+    st.markdown('</div>', unsafe_allow_html=True)
+
+    st.markdown(f'<div id="reportwrap_{chat_id}_{idx}" style="display:none;">', unsafe_allow_html=True)
+    if st.button(" ", key=f"reportbtn_{chat_id}_{idx}"):
+        st.toast("Thanks — this has been reported.")
+    st.markdown('</div>', unsafe_allow_html=True)
 
     # "What went wrong?" reason card — Gemini's actual bad-response flow,
-    # shown right under the icon row when thumbs-down is active. Reason
-    # chips use st.container(horizontal=True), which natively flex-wraps
-    # (overflows to the next line) and lets each button size to its own
-    # text instead of being stretched into an equal-width grid cell — that
-    # equal-width-columns approach was what made the old version look like
-    # a grid of boxes instead of Gemini's flowing pill row.
+    # shown right under the icon row when thumbs-down is active.
     if st.session_state.get(feedback_card_key):
-        with st.container(border=False, key=f"feedbackpanel_{chat_id}_{idx}"):
+        with st.container(border=True):
             col_title, col_close = st.columns([10, 1])
             with col_title:
                 st.markdown("**What went wrong?**")
@@ -290,9 +350,10 @@ def render_assistant_message_actions(chat_id: str, idx: int, content: str, messa
                               type="tertiary", help="Close"):
                     st.session_state[feedback_card_key] = False
                     st.rerun()
-            with st.container(key=f"reasons_{chat_id}_{idx}", horizontal=True, gap="small"):
-                for reason in _BAD_RESPONSE_REASONS:
-                    if st.button(reason, key=f"reason_{chat_id}_{idx}_{reason}"):
+            reason_cols = st.columns(len(_BAD_RESPONSE_REASONS))
+            for reason_col, reason in zip(reason_cols, _BAD_RESPONSE_REASONS):
+                with reason_col:
+                    if st.button(reason, key=f"reason_{chat_id}_{idx}_{reason}", type="tertiary"):
                         st.session_state[feedback_card_key] = False
                         st.toast("Thanks for the detail — noted.")
                         st.rerun()
@@ -561,42 +622,6 @@ st.markdown("""
 
     #MainMenu {visibility: hidden;}
     footer {visibility: hidden;}
-
-    /* ---- "What went wrong?" feedback reason chips — real pill buttons,
-       auto-sized to their own text and flex-wrapping, not a grid of
-       equal-width boxes. [class*="..."] is a substring match on the class
-       attribute, needed because the container's key (and so its
-       st-key-<key> class) includes the dynamic chat/message id — this
-       still matches every instance since they all share the "reasons_"
-       prefix. st-key- itself is Streamlit's own documented CSS hook for
-       st.container(key=...), not a private/undocumented testid. ---- */
-    div[class*="st-key-reasons_"] button {
-        background-color: #f0f1f3 !important;
-        border: none !important;
-        border-radius: 20px !important;
-        color: #1f1f1f !important;
-        padding: 8px 18px !important;
-        font-size: 14px !important;
-        min-height: unset !important;
-    }
-    div[class*="st-key-reasons_"] button:hover {
-        background-color: #e0e2e5 !important;
-    }
-    /* The floating feedback card itself — border=False on the container
-       (see app.py) means Streamlit draws NO box of its own here; this
-       rule is what actually creates the card surface: white background,
-       one thin subtle border, soft shadow, rounded corners, and internal
-       padding. Previously this stacked CSS rounding on TOP of Streamlit's
-       own default straight-edged border=True box, which is what produced
-       the mismatched "still a box" look. */
-    div[class*="st-key-feedbackpanel_"] {
-        background-color: #ffffff;
-        border: 1px solid #e8eaed;
-        border-radius: 16px;
-        box-shadow: 0 1px 6px rgba(0, 0, 0, 0.10);
-        padding: 18px 20px;
-        margin: 4px 0 12px 0;
-    }
     </style>
 """, unsafe_allow_html=True)
 
@@ -720,13 +745,7 @@ def _stream_assistant_reply(prompt: str, images=None) -> None:
     'edit message' resend path (see the edit UI in the render loop below),
     so both regenerate a response the exact same way. Assumes the user's
     message has ALREADY been appended to chat["messages"] — history is
-    built from everything before it.
-
-    Also renders the new message's action row (👍/👎/copy/etc.) right
-    away — without this, the row only appeared on the render loop at the
-    TOP of the script, which doesn't run again until the next interaction,
-    so actions looked like they were missing on the message you just got
-    and only "caught up" a turn later."""
+    built from everything before it."""
     text_history = [m for m in chat["messages"][:-1] if m.get("type", "text") == "text"]
     response_container = st.empty()
     full_response = ""
@@ -737,9 +756,7 @@ def _stream_assistant_reply(prompt: str, images=None) -> None:
         full_response += chunk
         response_container.markdown(_build_bubble_html("assistant", full_response + "▌"), unsafe_allow_html=True)
     response_container.markdown(_build_bubble_html("assistant", full_response), unsafe_allow_html=True)
-    new_message = {"role": "assistant", "type": "text", "content": full_response}
-    chat["messages"].append(new_message)
-    render_assistant_message_actions(chat_id, len(chat["messages"]) - 1, full_response, new_message)
+    chat["messages"].append({"role": "assistant", "type": "text", "content": full_response})
 
 
 chat_id = st.session_state.current_chat_id
@@ -910,7 +927,6 @@ if mode == "chat":
         render_message_bubble("user", display_prompt)
         for img_bytes, _mime in pending_images:
             st.image(img_bytes, width=220)
-        render_user_message_actions(chat_id, len(chat["messages"]) - 1, display_prompt)
 
         if failed:
             st.warning(f"Couldn't extract text from: {', '.join(failed)} "
@@ -918,6 +934,14 @@ if mode == "chat":
                        f"or OCR couldn't read the image/handwriting clearly).")
 
         _stream_assistant_reply(prompt, images=pending_images or None)
+        # Without this rerun, the just-added assistant message only shows
+        # its action row (copy/edit/regenerate/etc) on the NEXT user
+        # interaction — the streamed reply above is drawn inline during
+        # THIS run, before it ever passes through the render loop that
+        # attaches those buttons. Rerunning immediately routes it through
+        # that same loop right away, so the icons appear instantly instead
+        # of one message late (confirmed bug from user testing).
+        st.rerun()
 
 elif mode == "image":
     if prompt := st.chat_input("Describe the image you want to generate"):
