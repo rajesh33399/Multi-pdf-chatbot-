@@ -250,26 +250,34 @@ def render_assistant_message_actions(chat_id: str, idx: int, content: str, messa
     # "⋯" menu — rendered ABOVE the icon row per the Gemini reference, as
     # a compact floating card (not full message width — stretching it
     # with use_container_width=True was the "far away from the icon"
-    # look reported in testing; Gemini's own menu is a narrow ~220px
-    # panel that sits right next to the trigger).
+    # look reported in testing). Also horizontally offset with a leading
+    # spacer column matching the icon row's own ratio below ([1,1,1,1,1,
+    # 12] — the "⋯" icon is the 5th of 17 parts, i.e. ~4/17 of the row)
+    # so the menu's LEFT EDGE lines up under the "⋯" icon itself instead
+    # of starting from the far-left message margin — that left-margin
+    # start was the actual "far away" bug (Streamlit blocks default to
+    # full container width; a plain st.button has no notion of "next to
+    # the icon that opened it" without an explicit offset like this).
     if st.session_state.get(more_key):
-        st.markdown('<div class="sparkai-card sparkai-card-narrow">', unsafe_allow_html=True)
-        if st.button("Branch in new chat", icon=":material/call_split:",
-                      key=f"branchbtn_{chat_id}_{idx}", type="tertiary"):
-            _branch_chat(chat_id, idx)
-            st.session_state[more_key] = False
-            st.rerun()
-        if st.button("Listen", icon=":material/volume_up:",
-                      key=f"listenbtn_{chat_id}_{idx}", type="tertiary"):
-            st.session_state[speak_key] = True
-            st.session_state[more_key] = False
-            st.rerun()
-        if st.button("Report legal issue", icon=":material/flag:",
-                      key=f"reportbtn_{chat_id}_{idx}", type="tertiary"):
-            st.toast("Thanks — this has been reported.")
-            st.session_state[more_key] = False
-            st.rerun()
-        st.markdown('</div>', unsafe_allow_html=True)
+        _menu_spacer, menu_col = st.columns([4, 13])
+        with menu_col:
+            st.markdown('<div class="sparkai-card sparkai-card-narrow">', unsafe_allow_html=True)
+            if st.button("Branch in new chat", icon=":material/call_split:",
+                          key=f"branchbtn_{chat_id}_{idx}", type="tertiary"):
+                _branch_chat(chat_id, idx)
+                st.session_state[more_key] = False
+                st.rerun()
+            if st.button("Listen", icon=":material/volume_up:",
+                          key=f"listenbtn_{chat_id}_{idx}", type="tertiary"):
+                st.session_state[speak_key] = True
+                st.session_state[more_key] = False
+                st.rerun()
+            if st.button("Report legal issue", icon=":material/flag:",
+                          key=f"reportbtn_{chat_id}_{idx}", type="tertiary"):
+                st.toast("Thanks — this has been reported.")
+                st.session_state[more_key] = False
+                st.rerun()
+            st.markdown('</div>', unsafe_allow_html=True)
 
     # Fires browser text-to-speech once, right after 'Listen' is clicked
     # above (the flag is cleared immediately so it only speaks once).
