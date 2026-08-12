@@ -231,8 +231,8 @@ def render_assistant_message_actions(chat_id: str, idx: int, content: str, messa
     highlights AND opens a 'What went wrong?' reason-pill card; copy is
     instant client-side (no visible box, no server round-trip); '⋯' opens
     a compact menu with Branch in new chat / Listen / Report legal issue,
-    shown ABOVE the icon row. Both panels use a shared '.sparkai-card' CSS
-    class — a white, rounded, soft-shadow floating card matching Gemini's
+    shown ABOVE the icon row. Both panels use real st.container(key=...)
+    calls styled via Streamlit's auto-generated '.st-key-<key>' CSS class — a white, rounded, soft-shadow floating card matching Gemini's
     actual look — rather than Streamlit's flat-grey st.container(border=
     True) or no styling at all. An earlier version tried hiding real
     buttons inside a raw `display:none` div and clicking them via cross-
@@ -261,23 +261,31 @@ def render_assistant_message_actions(chat_id: str, idx: int, content: str, messa
     if st.session_state.get(more_key):
         _menu_spacer, menu_col = st.columns([4, 13])
         with menu_col:
-            st.markdown('<div class="sparkai-card sparkai-card-narrow">', unsafe_allow_html=True)
-            if st.button("Branch in new chat", icon=":material/call_split:",
-                          key=f"branchbtn_{chat_id}_{idx}", type="tertiary"):
-                _branch_chat(chat_id, idx)
-                st.session_state[more_key] = False
-                st.rerun()
-            if st.button("Listen", icon=":material/volume_up:",
-                          key=f"listenbtn_{chat_id}_{idx}", type="tertiary"):
-                st.session_state[speak_key] = True
-                st.session_state[more_key] = False
-                st.rerun()
-            if st.button("Report legal issue", icon=":material/flag:",
-                          key=f"reportbtn_{chat_id}_{idx}", type="tertiary"):
-                st.toast("Thanks — this has been reported.")
-                st.session_state[more_key] = False
-                st.rerun()
-            st.markdown('</div>', unsafe_allow_html=True)
+            # Real st.container(key=...) — not a raw <div> wrapper. Streamlit
+            # guarantees genuine DOM nesting for this (it auto-generates a
+            # stable '.st-key-<key>' class on the actual wrapping element),
+            # unlike the raw-HTML div trick tried earlier, which turned out
+            # to render as an empty floating box while the real buttons
+            # ended up as unstyled siblings outside it (confirmed in
+            # testing — Streamlit isolates each st.markdown call into its
+            # own container and auto-closes unclosed tags immediately, so
+            # that trick never actually worked for nesting real content).
+            with st.container(key=f"morecard_{chat_id}_{idx}"):
+                if st.button("Branch in new chat", icon=":material/call_split:",
+                              key=f"branchbtn_{chat_id}_{idx}", type="tertiary"):
+                    _branch_chat(chat_id, idx)
+                    st.session_state[more_key] = False
+                    st.rerun()
+                if st.button("Listen", icon=":material/volume_up:",
+                              key=f"listenbtn_{chat_id}_{idx}", type="tertiary"):
+                    st.session_state[speak_key] = True
+                    st.session_state[more_key] = False
+                    st.rerun()
+                if st.button("Report legal issue", icon=":material/flag:",
+                              key=f"reportbtn_{chat_id}_{idx}", type="tertiary"):
+                    st.toast("Thanks — this has been reported.")
+                    st.session_state[more_key] = False
+                    st.rerun()
 
     # Fires browser text-to-speech once, right after 'Listen' is clicked
     # above (the flag is cleared immediately so it only speaks once).
@@ -318,27 +326,27 @@ def render_assistant_message_actions(chat_id: str, idx: int, content: str, messa
             st.rerun()
 
     # "What went wrong?" reason card — Gemini's actual bad-response flow,
-    # shown right under the icon row when thumbs-down is active, styled
-    # as the same soft-shadow floating card as the "⋯" menu (see CSS).
+    # shown right under the icon row when thumbs-down is active. Uses a
+    # real st.container(key=...) for the same reliability reason as the
+    # "⋯" menu above — see that block's comment.
     if st.session_state.get(feedback_card_key):
-        st.markdown('<div class="sparkai-card">', unsafe_allow_html=True)
-        col_title, col_close = st.columns([10, 1])
-        with col_title:
-            st.markdown("**What went wrong?**")
-            st.caption("Your feedback helps improve SparkAI.")
-        with col_close:
-            if st.button(" ", icon=":material/close:", key=f"closefb_{chat_id}_{idx}",
-                          type="tertiary", help="Close"):
-                st.session_state[feedback_card_key] = False
-                st.rerun()
-        reason_cols = st.columns(len(_BAD_RESPONSE_REASONS))
-        for reason_col, reason in zip(reason_cols, _BAD_RESPONSE_REASONS):
-            with reason_col:
-                if st.button(reason, key=f"reason_{chat_id}_{idx}_{reason}", type="tertiary"):
+        with st.container(key=f"feedbackcard_{chat_id}_{idx}"):
+            col_title, col_close = st.columns([10, 1])
+            with col_title:
+                st.markdown("**What went wrong?**")
+                st.caption("Your feedback helps improve SparkAI.")
+            with col_close:
+                if st.button(" ", icon=":material/close:", key=f"closefb_{chat_id}_{idx}",
+                              type="tertiary", help="Close"):
                     st.session_state[feedback_card_key] = False
-                    st.toast("Thanks for the detail — noted.")
                     st.rerun()
-        st.markdown('</div>', unsafe_allow_html=True)
+            reason_cols = st.columns(len(_BAD_RESPONSE_REASONS))
+            for reason_col, reason in zip(reason_cols, _BAD_RESPONSE_REASONS):
+                with reason_col:
+                    if st.button(reason, key=f"reason_{chat_id}_{idx}_{reason}", type="tertiary"):
+                        st.session_state[feedback_card_key] = False
+                        st.toast("Thanks for the detail — noted.")
+                        st.rerun()
 
 
 # -------------------------------------------------------------------------
@@ -609,20 +617,26 @@ st.markdown("""
        feedback panel — matches Gemini's actual style: white background,
        soft shadow, rounded corners. NOT Streamlit's default
        st.container(border=True), which renders a flat grey 1px outline
-       instead — visibly different from Gemini's softer look. Applied via
-       a wrapping div (single-line open/close st.markdown calls around
-       purely decorative styling — proven reliable elsewhere in this file
-       for image/video rows and message bubbles; unlike the earlier
-       abandoned attempt to HIDE interactive buttons this way, styling
-       already-visible content this way works fine). */
-    .sparkai-card {
-        background: #ffffff;
-        border-radius: 12px;
-        box-shadow: 0 1px 3px rgba(0,0,0,0.3);
-        padding: 14px 18px;
-        margin: 6px 0;
+       instead. Targets Streamlit's own auto-generated '.st-key-<key>'
+       class (documented, stable — added automatically to the real
+       wrapping element when a container/widget is given a `key=`), NOT
+       a raw HTML <div> wrapper. An earlier version tried the raw-div
+       approach and it rendered as an empty floating box while the real
+       buttons ended up unstyled outside it — confirmed in testing:
+       Streamlit isolates each st.markdown call into its own container
+       and auto-closes unclosed tags immediately, so that trick never
+       actually nested real content. Attribute-contains selector ([class
+       *="..."]) is used because the full key includes a per-message
+       chat_id/idx suffix that isn't known here. */
+    div[class*="st-key-morecard_"],
+    div[class*="st-key-feedbackcard_"] {
+        background: #ffffff !important;
+        border-radius: 12px !important;
+        box-shadow: 0 1px 3px rgba(0,0,0,0.3) !important;
+        padding: 14px 18px !important;
+        margin: 6px 0 !important;
     }
-    .sparkai-card-narrow {
+    div[class*="st-key-morecard_"] {
         max-width: 240px;
     }
     </style>
