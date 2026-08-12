@@ -230,43 +230,46 @@ def render_assistant_message_actions(chat_id: str, idx: int, content: str, messa
     order matched to Gemini. Thumbs-up just highlights; thumbs-down
     highlights AND opens a 'What went wrong?' reason-pill card; copy is
     instant client-side (no visible box, no server round-trip); '⋯' opens
-    a menu with Branch in new chat / Listen / Report legal issue, shown
-    ABOVE the icon row (matching the reference video) using real, native
-    st.button widgets with full text labels — not custom HTML. An earlier
-    version tried hiding real buttons inside a raw `display:none` div and
-    clicking them via cross-frame JS; that div-wrapping trick turned out
-    to only work for decorative content, not interactive widgets (the
-    buttons rendered as empty visible boxes instead of staying hidden —
-    confirmed in testing), so this drops that approach entirely in favor
-    of plain session_state-driven conditional rendering, which is slower
-    by one rerun but 100% reliable."""
+    a compact menu with Branch in new chat / Listen / Report legal issue,
+    shown ABOVE the icon row. Both panels use a shared '.sparkai-card' CSS
+    class — a white, rounded, soft-shadow floating card matching Gemini's
+    actual look — rather than Streamlit's flat-grey st.container(border=
+    True) or no styling at all. An earlier version tried hiding real
+    buttons inside a raw `display:none` div and clicking them via cross-
+    frame JS; that div-wrapping trick turned out to only work for
+    decorative content, not interactive widgets (the buttons rendered as
+    empty visible boxes instead of staying hidden — confirmed in
+    testing), so this drops that approach entirely in favor of plain
+    session_state-driven conditional rendering, which is slower by one
+    rerun but 100% reliable."""
     more_key = f"showmore_{chat_id}_{idx}"
     feedback = message.get("feedback")
     feedback_card_key = f"feedbackcard_{chat_id}_{idx}"
     speak_key = f"speaknow_{chat_id}_{idx}"
 
-    # "⋯" menu — rendered ABOVE the icon row per the Gemini reference.
-    # No border/box (removed per user feedback — Gemini's dropdown reads
-    # as a plain floating list, not an outlined container).
+    # "⋯" menu — rendered ABOVE the icon row per the Gemini reference, as
+    # a compact floating card (not full message width — stretching it
+    # with use_container_width=True was the "far away from the icon"
+    # look reported in testing; Gemini's own menu is a narrow ~220px
+    # panel that sits right next to the trigger).
     if st.session_state.get(more_key):
+        st.markdown('<div class="sparkai-card sparkai-card-narrow">', unsafe_allow_html=True)
         if st.button("Branch in new chat", icon=":material/call_split:",
-                      key=f"branchbtn_{chat_id}_{idx}", type="tertiary",
-                      use_container_width=True):
+                      key=f"branchbtn_{chat_id}_{idx}", type="tertiary"):
             _branch_chat(chat_id, idx)
             st.session_state[more_key] = False
             st.rerun()
         if st.button("Listen", icon=":material/volume_up:",
-                      key=f"listenbtn_{chat_id}_{idx}", type="tertiary",
-                      use_container_width=True):
+                      key=f"listenbtn_{chat_id}_{idx}", type="tertiary"):
             st.session_state[speak_key] = True
             st.session_state[more_key] = False
             st.rerun()
         if st.button("Report legal issue", icon=":material/flag:",
-                      key=f"reportbtn_{chat_id}_{idx}", type="tertiary",
-                      use_container_width=True):
+                      key=f"reportbtn_{chat_id}_{idx}", type="tertiary"):
             st.toast("Thanks — this has been reported.")
             st.session_state[more_key] = False
             st.rerun()
+        st.markdown('</div>', unsafe_allow_html=True)
 
     # Fires browser text-to-speech once, right after 'Listen' is clicked
     # above (the flag is cleared immediately so it only speaks once).
@@ -307,10 +310,10 @@ def render_assistant_message_actions(chat_id: str, idx: int, content: str, messa
             st.rerun()
 
     # "What went wrong?" reason card — Gemini's actual bad-response flow,
-    # shown right under the icon row when thumbs-down is active. No
-    # border/box (removed per user feedback — Gemini's card reads as
-    # plain content, not an outlined container).
+    # shown right under the icon row when thumbs-down is active, styled
+    # as the same soft-shadow floating card as the "⋯" menu (see CSS).
     if st.session_state.get(feedback_card_key):
+        st.markdown('<div class="sparkai-card">', unsafe_allow_html=True)
         col_title, col_close = st.columns([10, 1])
         with col_title:
             st.markdown("**What went wrong?**")
@@ -327,6 +330,7 @@ def render_assistant_message_actions(chat_id: str, idx: int, content: str, messa
                     st.session_state[feedback_card_key] = False
                     st.toast("Thanks for the detail — noted.")
                     st.rerun()
+        st.markdown('</div>', unsafe_allow_html=True)
 
 
 # -------------------------------------------------------------------------
@@ -592,6 +596,27 @@ st.markdown("""
 
     #MainMenu {visibility: hidden;}
     footer {visibility: hidden;}
+
+    /* ---- Floating card look for the "⋯" menu and the "What went wrong?"
+       feedback panel — matches Gemini's actual style: white background,
+       soft shadow, rounded corners. NOT Streamlit's default
+       st.container(border=True), which renders a flat grey 1px outline
+       instead — visibly different from Gemini's softer look. Applied via
+       a wrapping div (single-line open/close st.markdown calls around
+       purely decorative styling — proven reliable elsewhere in this file
+       for image/video rows and message bubbles; unlike the earlier
+       abandoned attempt to HIDE interactive buttons this way, styling
+       already-visible content this way works fine). */
+    .sparkai-card {
+        background: #ffffff;
+        border-radius: 12px;
+        box-shadow: 0 1px 3px rgba(0,0,0,0.3);
+        padding: 14px 18px;
+        margin: 6px 0;
+    }
+    .sparkai-card-narrow {
+        max-width: 240px;
+    }
     </style>
 """, unsafe_allow_html=True)
 
