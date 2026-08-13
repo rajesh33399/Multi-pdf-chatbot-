@@ -1,6 +1,7 @@
 """
 app.py — SparkAI: Gemini-style layout with multi-chat sessions, image
-generation, video generation, and document (PDF/ZIP/TXT) upload for RAG.
+generation, video generation, document (PDF/ZIP/TXT) upload for RAG,
+and Google OAuth Authentication.
 """
 import html
 import io
@@ -30,11 +31,16 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
-# Initialize Supabase connection
+# -------------------------------------------------------------------------
+# SUPABASE CONFIGURATION
+# -------------------------------------------------------------------------
+SUPABASE_URL = "https://oggydaxjtjvglcbyezhey.supabase.co"
+SUPABASE_KEY = "YOUR_SUPABASE_ANON_KEY" # Replace with your actual anon/public key if using secrets, or use st.secrets
+
 @st.cache_resource
 def init_supabase():
-    url = st.secrets["SUPABASE_URL"]
-    key = st.secrets["SUPABASE_KEY"]
+    url = SUPABASE_URL if SUPABASE_URL else st.secrets["SUPABASE_URL"]
+    key = SUPABASE_KEY if SUPABASE_KEY != "YOUR_SUPABASE_ANON_KEY" else st.secrets["SUPABASE_KEY"]
     return create_client(url, key)
 
 supabase = init_supabase()
@@ -42,12 +48,34 @@ supabase = init_supabase()
 if "user" not in st.session_state:
     st.session_state["user"] = None
 
+# Check session state from Supabase client if active
+session = supabase.auth.get_session()
+if session and session.user:
+    st.session_state["user"] = session.user
+
 # -------------------------------------------------------------------------
-# LOGIN & SIGNUP GATE
+# LOGIN & SIGNUP GATE (Google OAuth & Password)
 # -------------------------------------------------------------------------
 if not st.session_state["user"]:
     st.title("✨ SparkAI - Login")
-    tab1, tab2 = st.tabs(["Log In", "Sign Up"])
+    st.write("Sign in securely using your Google account or email.")
+    
+    # Google OAuth Button
+    if st.button("Continue with Google", use_container_width=True):
+        try:
+            res = supabase.auth.sign_in_with_oauth({
+                "provider": "google",
+                "options": {
+                    "redirectTo": "http://localhost:8501" # Update this when deploying to production
+                }
+            })
+            if res.url:
+                st.markdown(f'<meta http-equiv="refresh" content="0;url={res.url}">', unsafe_allow_html=True)
+        except Exception as e:
+            st.error(f"Failed to initialize Google login: {e}")
+
+    st.markdown("---")
+    tab1, tab2 = st.tabs(["Log In with Password", "Sign Up"])
 
     with tab1:
         email = st.text_input("Email", key="login_email")
@@ -67,7 +95,7 @@ if not st.session_state["user"]:
         if st.button("Create Account"):
             try:
                 supabase.auth.sign_up({"email": signup_email, "password": signup_pass})
-                st.success("Account created! You can now log in.")
+                st.success("Account created! Check your email or log in if verification is disabled.")
             except Exception as e:
                 st.error(f"Sign up failed: {e}")
 
@@ -76,7 +104,7 @@ if not st.session_state["user"]:
 # -------------------------------------------------------------------------
 else:
     user_id = st.session_state["user"].id
-    user_email = st.session_state["user"].email
+    user_email = st.session_state["user"].email if hasattr(st.session_state["user"], "email") else st.session_state["user"].get("email", "User")
 
     # Session state — each chat is its own entry: {title, messages, pinned,
     # mode, created, context}. `context` holds extracted text from any files
@@ -253,17 +281,17 @@ else:
             with menu_col:
                 with st.container(key=f"morecard_{chat_id}_{idx}"):
                     if st.button("Branch in new chat", icon=":material/call_split:",
-                                 key=f"branchbtn_{chat_id}_{idx}", type="tertiary"):
+                                   key=f"branchbtn_{chat_id}_{idx}", type="tertiary"):
                         _branch_chat(chat_id, idx)
                         st.session_state[more_key] = False
                         st.rerun()
                     if st.button("Listen", icon=":material/volume_up:",
-                                 key=f"listenbtn_{chat_id}_{idx}", type="tertiary"):
+                                   key=f"listenbtn_{chat_id}_{idx}", type="tertiary"):
                         st.session_state[speak_key] = True
                         st.session_state[more_key] = False
                         st.rerun()
                     if st.button("Report legal issue", icon=":material/flag:",
-                                 key=f"reportbtn_{chat_id}_{idx}", type="tertiary"):
+                                   key=f"reportbtn_{chat_id}_{idx}", type="tertiary"):
                         st.toast("Thanks — this has been reported.")
                         st.session_state[more_key] = False
                         st.rerun()
@@ -312,7 +340,7 @@ else:
                     st.caption("Your feedback helps improve SparkAI.")
                 with col_close:
                     if st.button(" ", icon=":material/close:", key=f"closefb_{chat_id}_{idx}",
-                                 type="tertiary", help="Close"):
+                                   type="tertiary", help="Close"):
                         st.session_state[feedback_card_key] = False
                         st.rerun()
                 reason_cols = st.columns(len(_BAD_RESPONSE_REASONS))
